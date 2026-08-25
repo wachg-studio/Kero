@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <clipPath id="orb"><circle cx="512" cy="512" r="414"/></clipPath>
+    <filter id="mist" x="-35%" y="-35%" width="170%" height="170%">
+      <feGaussianBlur stdDeviation="104"/>
+    </filter>
+    <filter id="small-mist" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="36"/>
+    </filter>
+    <radialGradient id="sphere" cx="31%" cy="22%" r="92%">
+      <stop offset="0" stop-color="#fff7d6"/>
+      <stop offset=".14" stop-color="#ffd56a"/>
+      <stop offset=".39" stop-color="#6edeb3"/>
+      <stop offset=".68" stop-color="#38bde8"/>
+      <stop offset="1" stop-color="#5b5bdf"/>
+    </radialGradient>
+    <radialGradient id="highlight" cx="50%" cy="46%" r="54%">
+      <stop stop-color="#fff" stop-opacity=".78"/>
+      <stop offset=".38" stop-color="#fff" stop-opacity=".15"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <circle cx="512" cy="512" r="414" fill="url(#sphere)"/>
+  <g clip-path="url(#orb)">
+    <ellipse cx="235" cy="322" rx="292" ry="270" fill="#f26a67" opacity=".8" filter="url(#mist)"/>
+    <ellipse cx="526" cy="198" rx="276" ry="210" fill="#ffc744" opacity=".69" filter="url(#mist)"/>
+    <ellipse cx="822" cy="424" rx="278" ry="328" fill="#37d59d" opacity=".78" filter="url(#mist)"/>
+    <ellipse cx="662" cy="810" rx="320" ry="248" fill="#25bce8" opacity=".84" filter="url(#mist)"/>
+    <ellipse cx="258" cy="748" rx="310" ry="286" fill="#7059e5" opacity=".88" filter="url(#mist)"/>
+    <ellipse cx="368" cy="358" rx="175" ry="138" fill="url(#highlight)" opacity=".77" filter="url(#small-mist)"/>
+    <ellipse cx="308" cy="263" rx="94" ry="62" transform="rotate(-30 308 263)" fill="#fff" opacity=".57" filter="url(#small-mist)"/>
+  </g>
+  <circle cx="512" cy="512" r="414" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="5"/>
+</svg>

@@ -1,0 +1,100 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kero",
+  "version": "2.0.0",
+  "identifier": "com.kero.desktop",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "pnpm build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Kero",
+        "width": 420,
+        "height": 72,
+        "minWidth": 340,
+        "minHeight": 72,
+        "resizable": false,
+        "maximizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false
+      },
+      {
+        "label": "edge",
+        "title": "Kero Edge Glow",
+        "url": "index.html?view=edge",
+        "width": 1920,
+        "height": 1080,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "focusable": false,
+        "visible": false
+      },
+      {
+        "label": "chat",
+        "title": "Kero 对话",
+        "url": "index.html?view=chat",
+        "width": 610,
+        "height": 720,
+        "minWidth": 470,
+        "minHeight": 540,
+        "resizable": true,
+        "minimizable": true,
+        "maximizable": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": false,
+        "visible": false
+      },
+      {
+        "label": "settings",
+        "title": "Kero 设置",
+        "url": "index.html?view=settings",
+        "width": 880,
+        "height": 700,
+        "minWidth": 720,
+        "minHeight": 580,
+        "resizable": false,
+        "minimizable": true,
+        "decorations": false,
+        "transparent": true,
+        "shadow": false,
+        "skipTaskbar": false,
+        "visible": false
+      }
+    ],
+    "security": {
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": ["$APPLOCALDATA/**"]
+      }
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/icon.ico",
+      "icons/icon.png"
+    ],
+    "windows": {
+      "wix": {
+        "language": ["zh-CN"]
+      }
+    }
+  }
+}

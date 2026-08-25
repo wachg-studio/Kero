@@ -1,0 +1,30 @@
+# Frontend and Rust build outputs
+node_modules/
+dist/
+src-tauri/target/
+
+# Local screenshots and generated test artifacts
+output/
+.playwright-cli/
+
+# Local environment and secrets
+.env
+.env.*
+*.local
+data/
+providers.json
+secrets.json
+runtime.log
+runtime.previous.log
+computer-control.log
+runtime.active
+
+# Editors and OS files
+.vscode/
+.idea/
+*.user
+*.suo
+Thumbs.db
+Desktop.ini
+
+# Release files are intentionally kept under downloads/
