@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { emitTo, listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Check, ChevronDown, Cpu, Globe2, ImagePlus, KeyRound, Languages, Laptop, Mic2, Minus, MousePointer2, Plus, Power, Save, ShieldCheck, SlidersHorizontal, Trash2, TriangleAlert, Waves, X } from "lucide-react";
 import { FormEvent, PointerEvent, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { flushSync } from "react-dom";
@@ -57,8 +58,8 @@ const defaultAppearance: Appearance = {
   dictationCorrection: true,
   dictationMemory: true,
   dictationEdgeEnabled: true,
-  dictationMode: "native",
-  aiDictationPolish: false,
+  dictationMode: "ai",
+  aiDictationPolish: true,
   realtimeEdgeEnabled: true,
   clickThrough: false,
   positionLocked: false,
@@ -139,7 +140,7 @@ function readAppearance(): Appearance {
       dictationCorrection: saved.dictationCorrection !== false,
       dictationMemory: saved.dictationMemory !== false,
       dictationEdgeEnabled: saved.dictationEdgeEnabled !== false,
-      dictationMode: saved.dictationMode === "ai" ? "ai" : "native",
+      dictationMode: saved.dictationMode === "native" ? "native" : "ai",
       aiDictationPolish: saved.aiDictationPolish === true,
       realtimeEdgeEnabled: saved.realtimeEdgeEnabled !== false,
       clickThrough: saved.clickThrough === true,
@@ -571,10 +572,21 @@ export function SettingsWindow() {
               <button type="button" className="save-image-generation" disabled={savingImageGeneration || !imageGeneration.model.trim()} onClick={() => void saveImageGeneration()}><Save size={14} /> {savingImageGeneration ? "正在保存" : "保存图片生成配置"}</button>
             </section>
             <section className="dictation-asr-settings">
-              <div className="appearance-heading"><span><Mic2 size={16} /> 语音识别</span><small>原生语音识别即时显示结果；AI 语音识别直接将录音交给专用语音模型。</small></div>
+              <div className="appearance-heading"><span><Mic2 size={16} /> 语音识别</span><small>推荐 AI 语音识别：按住 Alt 说话，文字实时上屏，松开后自动润色。原生模式使用系统内置识别，仅作免配置的备用方案。</small></div>
+              <p className="field-help">
+                还没有 API Key？前往{' '}
+                <a
+                  href="https://platform.qianwenai.com/home/"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    openUrl("https://platform.qianwenai.com/home/").catch(console.error);
+                  }}
+                >千问AI开放平台</a>
+                {' '}注册获取 Key——可获得完整使用本应用功能的模型（如实时语音识别 qwen3-asr-flash-realtime）。
+              </p>
               <div className="image-provider-choice" role="group" aria-label="语音识别模式">
+                <button type="button" className={appearance.dictationMode === "ai" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "ai" })}>AI 语音识别（推荐）</button>
                 <button type="button" className={appearance.dictationMode === "native" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "native" })}>原生语音识别</button>
-                <button type="button" className={appearance.dictationMode === "ai" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "ai" })}>AI 语音识别</button>
               </div>
               {appearance.dictationMode === "ai" && <>
                 <label>
@@ -583,14 +595,15 @@ export function SettingsWindow() {
                 </label>
                 <label>
                   <span>AI 语音识别模型</span>
-                  <input value={dictationAsr.model} onChange={(event) => setDictationAsr((current) => ({ ...current, model: event.target.value }))} placeholder="qwen3-asr-flash" />
+                  <input value={dictationAsr.model} onChange={(event) => setDictationAsr((current) => ({ ...current, model: event.target.value }))} placeholder="qwen3-asr-flash-realtime" />
+                  <small>推荐 qwen3-asr-flash-realtime，模型名含 realtime 或 streaming 时走流式识别（边说边出字）。fun-asr 是长音频异步模型，不能用于按住 Alt 听写。</small>
                 </label>
                 <label>
                   <span>AI 语音识别 API Key</span>
                   <div className="key-field"><KeyRound size={17} /><input type="password" value={dictationAsr.apiKey} onChange={(event) => setDictationAsr((current) => ({ ...current, apiKey: event.target.value }))} placeholder={dictationAsr.hasKey ? "留空则保留当前密钥" : "粘贴 DashScope API Key"} /></div>
                 </label>
                 <AppearanceSwitch enabled={appearance.aiDictationPolish} onToggle={() => updateAppearance({ aiDictationPolish: !appearance.aiDictationPolish })}>
-                  <span><b>AI 润色</b><small>转写完成后再交给当前语言模型整理标点、错字和表达；默认关闭以优先速度。</small></span>
+                  <span><b>AI 润色</b><small>松开按键后自动交给当前语言模型整理标点、语气词和表达，完成原位替换。</small></span>
                 </AppearanceSwitch>
                 {dictationAsrNotice && <p className={`form-notice ${dictationAsrNotice.startsWith("AI 语音识别配置") ? "success" : ""}`}>{dictationAsrNotice}</p>}
                 <button type="button" className="save-image-generation" disabled={savingDictationAsr || !dictationAsr.model.trim()} onClick={() => void saveDictationAsr()}><Save size={14} /> {savingDictationAsr ? "正在保存" : "保存 AI 语音识别配置"}</button>
@@ -714,10 +727,6 @@ export function SettingsWindow() {
                 onChange={(event) => updateDictationVocabulary(event.target.value)}
               />
             </label>
-            <AppearanceSwitch enabled={appearance.dictationEdgeEnabled} onToggle={() => updateAppearance({ dictationEdgeEnabled: !appearance.dictationEdgeEnabled })}>
-              <span><b>听写时显示边缘光</b><small>按住 Alt 听写和 AI 整理期间显示屏幕边缘光效。</small></span>
-              <Waves size={17} />
-            </AppearanceSwitch>
             <AppearanceSwitch enabled={appearance.realtimeEdgeEnabled} onToggle={() => updateAppearance({ realtimeEdgeEnabled: !appearance.realtimeEdgeEnabled })}>
               <span><b>实时通话显示边缘光</b><small>屏幕感知实时通话和模型回答期间显示边缘光效。</small></span>
               <Waves size={17} />

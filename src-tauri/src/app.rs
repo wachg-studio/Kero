@@ -22,7 +22,10 @@ use tauri::{
     tray::{MouseButton, TrayIconBuilder, TrayIconEvent},
     AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, WindowEvent,
 };
-use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, Message}};
+use tokio_tungstenite::{
+    connect_async,
+    tungstenite::{client::IntoClientRequest, Message},
+};
 use uuid::Uuid;
 
 mod dictation;
@@ -32,6 +35,11 @@ use dictation::capture_focus_target;
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(false);
 static ESCAPE_HELD: AtomicBool = AtomicBool::new(false);
 static ALT_HELD: AtomicBool = AtomicBool::new(false);
+// A bare Alt release activates the foreground app's menu bar on Windows. When
+// Alt starts an external dictation session, consume that whole key cycle.
+static ALT_DICTATION_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+// 从 Alt 按下开始到前端完成/取消听写为止；期间 Esc 用于取消听写而不是落到目标应用。
+static DICTATION_ACTIVE: AtomicBool = AtomicBool::new(false);
 static COMPUTER_CONTROL_STOPPED: AtomicBool = AtomicBool::new(true);
 static POINTER_TRACE_ACTIVE: AtomicBool = AtomicBool::new(false);
 static COMPUTER_CURSOR_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -295,68 +303,83 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: usize, data: isize) 
         CallNextHookEx, KBDLLHOOKSTRUCT, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
     };
 
-    let handled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let suppress = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> bool {
         if code >= 0 {
-        let hook = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
-        let key = hook.vkCode;
-        let is_injected = hook.flags & 0x10 != 0;
-        let is_pressed = message as u32 == WM_KEYDOWN || message as u32 == WM_SYSKEYDOWN;
-        let is_released = message as u32 == WM_KEYUP || message as u32 == WM_SYSKEYUP;
-        if key == 0x1b {
-            ESCAPE_HELD.store(is_pressed && !is_released, Ordering::SeqCst);
-            if is_pressed {
-                COMPUTER_CONTROL_STOPPED.store(true, Ordering::SeqCst);
-                restore_computer_cursor();
-                clear_computer_mark();
-                if let Some(app) = HOTKEY_APP.get() {
-                    let _ = app.emit_to("main", "kero:computer-control-stop", ());
-                }
-            }
-        } else if key == 0x12 || key == 0xa4 || key == 0xa5 {
-            if is_pressed && !ALT_HELD.swap(true, Ordering::SeqCst) {
-                capture_focus_target();
-                tauri::async_runtime::spawn(async {
-                    let _ = warm_dictation_service_inner().await;
-                });
-                if let Some(app) = HOTKEY_APP.get() {
-                    let _ = app.emit_to("main", "kero:shortcut-dictation-start", ());
-                }
-            } else if is_released && ALT_HELD.swap(false, Ordering::SeqCst) {
-                if let Some(app) = HOTKEY_APP.get() {
-                    let _ = app.emit_to("main", "kero:shortcut-dictation-stop", ());
-                }
-            }
-        } else if key == 0x4b && is_released {
-            K_MARK_HELD.store(false, Ordering::SeqCst);
-        } else if key == 0x4b && is_pressed && ESCAPE_HELD.load(Ordering::SeqCst) {
-            if let Some(app) = HOTKEY_APP.get() {
-                if CLICK_THROUGH.swap(false, Ordering::SeqCst) {
-                    if let Some(window) = app.get_webview_window("main") {
-                        let _ = window.set_ignore_cursor_events(false);
+            let hook = unsafe { &*(data as *const KBDLLHOOKSTRUCT) };
+            let key = hook.vkCode;
+            let is_injected = hook.flags & 0x10 != 0;
+            let is_pressed = message as u32 == WM_KEYDOWN || message as u32 == WM_SYSKEYDOWN;
+            let is_released = message as u32 == WM_KEYUP || message as u32 == WM_SYSKEYUP;
+            if (key == 0x12 || key == 0xa4 || key == 0xa5) && !is_injected {
+                if is_pressed && !ALT_HELD.swap(true, Ordering::SeqCst) {
+                    let captured_external_target = capture_focus_target();
+                    ALT_DICTATION_SUPPRESSED.store(captured_external_target, Ordering::SeqCst);
+                    DICTATION_ACTIVE.store(captured_external_target, Ordering::SeqCst);
+                    tauri::async_runtime::spawn(async {
+                        let _ = warm_dictation_service_inner().await;
+                    });
+                    if let Some(app) = HOTKEY_APP.get() {
+                        let _ = app.emit_to("main", "kero:shortcut-dictation-start", ());
                     }
-                    let _ = app.emit_to("main", "kero:click-through-changed", false);
+                } else if is_released && ALT_HELD.swap(false, Ordering::SeqCst) {
+                    if let Some(app) = HOTKEY_APP.get() {
+                        let _ = app.emit_to("main", "kero:shortcut-dictation-stop", ());
+                    }
+                    return ALT_DICTATION_SUPPRESSED.swap(false, Ordering::SeqCst);
+                }
+                return ALT_DICTATION_SUPPRESSED.load(Ordering::SeqCst);
+            }
+            if key == 0x1b {
+                ESCAPE_HELD.store(is_pressed && !is_released, Ordering::SeqCst);
+                if is_pressed {
+                    COMPUTER_CONTROL_STOPPED.store(true, Ordering::SeqCst);
+                    restore_computer_cursor();
+                    clear_computer_mark();
+                    if let Some(app) = HOTKEY_APP.get() {
+                        if DICTATION_ACTIVE.swap(false, Ordering::SeqCst) {
+                            // 听写进行中：Esc 取消听写并吞掉按键，不落到目标应用。
+                            let _ = app.emit_to("main", "kero:shortcut-dictation-cancel", ());
+                            return true;
+                        }
+                        let _ = app.emit_to("main", "kero:computer-control-stop", ());
+                    }
+                }
+            } else if key == 0x4b && is_released {
+                K_MARK_HELD.store(false, Ordering::SeqCst);
+            } else if key == 0x4b && is_pressed && ESCAPE_HELD.load(Ordering::SeqCst) {
+                if let Some(app) = HOTKEY_APP.get() {
+                    if CLICK_THROUGH.swap(false, Ordering::SeqCst) {
+                        if let Some(window) = app.get_webview_window("main") {
+                            let _ = window.set_ignore_cursor_events(false);
+                        }
+                        let _ = app.emit_to("main", "kero:click-through-changed", false);
+                    }
+                }
+            } else if key == 0x4b
+                && is_pressed
+                && !is_injected
+                && !COMPUTER_CONTROL_STOPPED.load(Ordering::SeqCst)
+                && COMPUTER_CURSOR_ACTIVE.load(Ordering::SeqCst)
+                && !K_MARK_HELD.swap(true, Ordering::SeqCst)
+            {
+                if let Some(app) = HOTKEY_APP.get() {
+                    let kind = if physical_shift_held() {
+                        ComputerMarkKind::Mistake
+                    } else {
+                        ComputerMarkKind::Target
+                    };
+                    place_computer_mark(app, kind);
                 }
             }
-        } else if key == 0x4b
-            && is_pressed
-            && !is_injected
-            && !COMPUTER_CONTROL_STOPPED.load(Ordering::SeqCst)
-            && COMPUTER_CURSOR_ACTIVE.load(Ordering::SeqCst)
-            && !K_MARK_HELD.swap(true, Ordering::SeqCst)
-        {
-            if let Some(app) = HOTKEY_APP.get() {
-                let kind = if physical_shift_held() {
-                    ComputerMarkKind::Mistake
-                } else {
-                    ComputerMarkKind::Target
-                };
-                place_computer_mark(app, kind);
-            }
         }
-        }
-    }));
-    if handled.is_err() {
+        false
+    }))
+    .unwrap_or_else(|_| {
         trace_runtime("recovered panic in keyboard hook");
+        false
+    });
+    if suppress {
+        return 1;
     }
     unsafe { CallNextHookEx(std::ptr::null_mut(), code, message, data) }
 }
@@ -1065,9 +1088,7 @@ fn load_config() -> Result<AppConfig, String> {
 // Preserve every other setting and let the next normal save rewrite a valid JSON document.
 fn recover_config_with_invalid_system_prompt(text: &str) -> Option<AppConfig> {
     let start = text.find("\"systemPrompt\"")?;
-    let end = text[start..]
-        .find("\n  \"contextEnabled\"")?
-        + start;
+    let end = text[start..].find("\n  \"contextEnabled\"")? + start;
     let mut repaired = String::with_capacity(text.len());
     repaired.push_str(&text[..start]);
     repaired.push_str("\"systemPrompt\": \"\",");
@@ -1089,8 +1110,8 @@ const AUTOSTART_VALUE_NAME: &str = "Kero";
 
 #[cfg(windows)]
 fn expected_autostart_command() -> Result<String, String> {
-    let executable = std::env::current_exe()
-        .map_err(|error| format!("无法读取 Kero 程序路径: {error}"))?;
+    let executable =
+        std::env::current_exe().map_err(|error| format!("无法读取 Kero 程序路径: {error}"))?;
     Ok(format!("\"{}\" --autostart", executable.display()))
 }
 
@@ -1131,10 +1152,9 @@ fn set_autostart_enabled(enabled: bool) -> Result<(), String> {
             key.set_value(AUTOSTART_VALUE_NAME, &expected_autostart_command()?)
                 .map_err(|error| format!("无法保存 Kero 启动项: {error}"))?;
         } else {
-            let key = match current_user.open_subkey_with_flags(
-                AUTOSTART_REGISTRY_PATH,
-                winreg::enums::KEY_SET_VALUE,
-            ) {
+            let key = match current_user
+                .open_subkey_with_flags(AUTOSTART_REGISTRY_PATH, winreg::enums::KEY_SET_VALUE)
+            {
                 Ok(key) => key,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(format!("无法打开 Windows 启动项: {error}")),
@@ -1324,8 +1344,14 @@ mod tests {
 
     #[test]
     fn generated_image_extension_detects_supported_formats() {
-        assert_eq!(generated_image_extension(b"\x89PNG\r\n\x1a\nimage"), Ok("png"));
-        assert_eq!(generated_image_extension(&[0xff, 0xd8, 0xff, 0xdb]), Ok("jpg"));
+        assert_eq!(
+            generated_image_extension(b"\x89PNG\r\n\x1a\nimage"),
+            Ok("png")
+        );
+        assert_eq!(
+            generated_image_extension(&[0xff, 0xd8, 0xff, 0xdb]),
+            Ok("jpg")
+        );
         assert_eq!(generated_image_extension(b"RIFFxxxxWEBPimage"), Ok("webp"));
         assert!(generated_image_extension(b"not-an-image").is_err());
     }
@@ -1359,6 +1385,37 @@ mod tests {
             read_secret(&provider_id).expect("removed key should be absent"),
             None
         );
+    }
+
+    #[test]
+    fn selects_the_dashscope_qwen_audio_flash_protocol() {
+        assert_eq!(
+            dashscope_asr_origin("https://dashscope.aliyuncs.com/compatible-mode/v1"),
+            Some("https://dashscope.aliyuncs.com")
+        );
+        assert!(is_dashscope_qwen_audio_flash_model(
+            "qwen-audio-3.0-asr-flash"
+        ));
+        assert!(is_dashscope_qwen_audio_flash_model(
+            "qwen-audio-3.0-asr-flash-2026-08-01"
+        ));
+        assert!(!is_dashscope_qwen_audio_flash_model(
+            "qwen-audio-3.0-asr-flash-filetrans"
+        ));
+        assert!(!is_dashscope_qwen_audio_flash_model(
+            "qwen-audio-3.0-asr-flash-streaming"
+        ));
+    }
+
+    #[test]
+    fn rejects_dashscope_long_audio_models_for_short_dictation() {
+        assert!(is_dashscope_long_audio_asr_model("fun-asr"));
+        assert!(is_dashscope_long_audio_asr_model("fun-asr-2025-11-07"));
+        assert!(is_dashscope_long_audio_asr_model("fun-asr-mtl"));
+        assert!(!is_dashscope_long_audio_asr_model(
+            "fun-asr-flash-2026-06-15"
+        ));
+        assert!(!is_dashscope_long_audio_asr_model("fun-asr-realtime"));
     }
 
     #[test]
@@ -1419,8 +1476,14 @@ mod tests {
             r#"{"action":"done","message":"saved","finalEvidence":"the saved indicator is visible"}"#,
         )
         .expect("done action should parse");
-        assert_eq!(retry.retry_evidence.as_deref(), Some("the dialog is still visible"));
-        assert_eq!(done.final_evidence.as_deref(), Some("the saved indicator is visible"));
+        assert_eq!(
+            retry.retry_evidence.as_deref(),
+            Some("the dialog is still visible")
+        );
+        assert_eq!(
+            done.final_evidence.as_deref(),
+            Some("the saved indicator is visible")
+        );
     }
 
     #[test]
@@ -1581,7 +1644,9 @@ fn public_image_generation_config(config: &ImageGenerationSettings) -> PublicIma
 
 #[tauri::command]
 fn get_image_generation_config() -> Result<PublicImageGenerationConfig, String> {
-    Ok(public_image_generation_config(&load_config()?.image_generation))
+    Ok(public_image_generation_config(
+        &load_config()?.image_generation,
+    ))
 }
 
 #[tauri::command]
@@ -1642,7 +1707,8 @@ fn save_dictation_asr_config(
     let model = config.model.trim();
     let api_key = config.api_key.unwrap_or_default().trim().to_string();
     let has_existing_key = has_secret(DICTATION_ASR_SECRET_ID);
-    if base_url.is_empty() || !(base_url.starts_with("https://") || base_url.starts_with("http://")) {
+    if base_url.is_empty() || !(base_url.starts_with("https://") || base_url.starts_with("http://"))
+    {
         return Err("请填写 AI 语音识别服务地址".to_string());
     }
     if model.is_empty() {
@@ -1665,7 +1731,14 @@ fn save_dictation_asr_config(
 }
 
 fn dictation_audio_extension(mime_type: &str) -> Result<&'static str, String> {
-    match mime_type.split(';').next().unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+    match mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "audio/webm" => Ok("webm"),
         "audio/ogg" => Ok("ogg"),
         "audio/wav" | "audio/x-wav" => Ok("wav"),
@@ -1675,8 +1748,43 @@ fn dictation_audio_extension(mime_type: &str) -> Result<&'static str, String> {
     }
 }
 
+fn dashscope_asr_origin(base_url: &str) -> Option<&'static str> {
+    let base_url = base_url.trim().to_ascii_lowercase();
+    if base_url.starts_with("https://dashscope-intl.aliyuncs.com") {
+        Some("https://dashscope-intl.aliyuncs.com")
+    } else if base_url.starts_with("https://dashscope.aliyuncs.com") {
+        Some("https://dashscope.aliyuncs.com")
+    } else {
+        None
+    }
+}
+
+fn is_dashscope_qwen_audio_flash_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model == "qwen-audio-3.0-asr-flash"
+        || (model.starts_with("qwen-audio-3.0-asr-flash-")
+            && !model.contains("filetrans")
+            && !model.contains("streaming"))
+}
+
+fn is_dashscope_long_audio_asr_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    (model == "fun-asr" || model.starts_with("fun-asr-") || model.starts_with("fun-asr-mtl"))
+        && !model.contains("flash")
+        && !model.contains("realtime")
+}
+
+fn unsupported_dashscope_dictation_model_message(model: &str) -> String {
+    format!(
+        "模型“{model}”是百炼的长音频异步转写模型，需要公网音频 URL 和任务轮询，不适合 Kero 的按住 Alt 短句听写。请改用 qwen-audio-3.0-asr-flash。"
+    )
+}
+
 #[tauri::command]
-async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> Result<String, String> {
+async fn transcribe_dictation_audio(
+    audio_base64: String,
+    mime_type: String,
+) -> Result<String, String> {
     let config = load_config()?.dictation_asr;
     if config.model.trim().is_empty() || config.base_url.trim().is_empty() {
         return Err("请先在设置中配置 AI 语音识别".to_string());
@@ -1693,18 +1801,46 @@ async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> 
     let extension = dictation_audio_extension(&mime_type)?;
     let mime = mime_type.split(';').next().unwrap_or("audio/webm").trim();
     let base_url = config.base_url.trim_end_matches('/');
-    let is_dashscope_qwen_asr = config.model.starts_with("qwen3-asr-")
-        && (base_url.starts_with("https://dashscope.aliyuncs.com")
-            || base_url.starts_with("https://dashscope-intl.aliyuncs.com"));
-    let response = if is_dashscope_qwen_asr {
-        let api_origin = if base_url.starts_with("https://dashscope-intl.aliyuncs.com") {
-            "https://dashscope-intl.aliyuncs.com"
-        } else {
-            "https://dashscope.aliyuncs.com"
-        };
+    let dashscope_origin = dashscope_asr_origin(base_url);
+    let model_name = config.model.trim();
+    trace_runtime(&format!(
+        "dictation transcription request model={model_name} mime={mime} bytes={} dashscope={}",
+        audio.len(),
+        dashscope_origin.is_some()
+    ));
+    if dashscope_origin.is_some() && is_dashscope_long_audio_asr_model(model_name) {
+        return Err(unsupported_dashscope_dictation_model_message(model_name));
+    }
+    let response = if dashscope_origin.is_some() && is_dashscope_qwen_audio_flash_model(model_name)
+    {
         let audio_url = format!("data:{mime};base64,{}", BASE64.encode(&audio));
         let request = serde_json::json!({
-            "model": config.model,
+            "model": model_name,
+            "input": {
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "input_audio",
+                        "input_audio": { "data": audio_url }
+                    }]
+                }]
+            },
+            "parameters": { "format": extension }
+        });
+        shared_http_client()
+            .post(format!(
+                "{}/api/v1/services/aigc/multimodal-generation/generation",
+                dashscope_origin.expect("DashScope origin was checked")
+            ))
+            .header("X-DashScope-SSE", "disable")
+            .bearer_auth(key)
+            .json(&request)
+            .send()
+            .await
+    } else if dashscope_origin.is_some() && model_name.starts_with("qwen3-asr-") {
+        let audio_url = format!("data:{mime};base64,{}", BASE64.encode(&audio));
+        let request = serde_json::json!({
+            "model": model_name,
             "input": {
                 "messages": [{
                     "role": "user",
@@ -1717,7 +1853,10 @@ async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> 
             }
         });
         shared_http_client()
-            .post(format!("{api_origin}/api/v1/services/aigc/multimodal-generation/generation"))
+            .post(format!(
+                "{}/api/v1/services/aigc/multimodal-generation/generation",
+                dashscope_origin.expect("DashScope origin was checked")
+            ))
             .bearer_auth(key)
             .json(&request)
             .send()
@@ -1744,10 +1883,7 @@ async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> 
         .await
         .map_err(|error| format!("无法读取 AI 语音识别结果: {error}"))?;
     let body = serde_json::from_str::<Value>(&body_text).map_err(|_| {
-        let summary = body_text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let summary = body_text.split_whitespace().collect::<Vec<_>>().join(" ");
         let summary = summary.chars().take(280).collect::<String>();
         if summary.is_empty() {
             format!("AI 语音识别服务返回了空响应 (HTTP {status})")
@@ -1755,6 +1891,17 @@ async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> 
             format!("AI 语音识别服务返回了非 JSON 响应 (HTTP {status}): {summary}")
         }
     })?;
+    let response_code = body.get("code").and_then(Value::as_str).unwrap_or("-");
+    let response_message = body
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("-")
+        .chars()
+        .take(180)
+        .collect::<String>();
+    trace_runtime(&format!(
+        "dictation transcription response status={status} code={response_code} message={response_message}"
+    ));
     if !status.is_success() {
         return Err(api_error(status, &body));
     }
@@ -1762,8 +1909,18 @@ async fn transcribe_dictation_audio(audio_base64: String, mime_type: String) -> 
         .and_then(Value::as_str)
         .or_else(|| body.pointer("/result/text").and_then(Value::as_str))
         .or_else(|| body.pointer("/output/text").and_then(Value::as_str))
-        .or_else(|| body.pointer("/output/choices/0/message/content/0/text").and_then(Value::as_str))
-        .or_else(|| body.pointer("/output/choices/0/message/content").and_then(Value::as_str))
+        .or_else(|| {
+            body.pointer("/output/output/sentence/text")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            body.pointer("/output/choices/0/message/content/0/text")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            body.pointer("/output/choices/0/message/content")
+                .and_then(Value::as_str)
+        })
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_string)
@@ -1784,85 +1941,360 @@ fn dictation_realtime_text(value: &Value) -> Option<&str> {
     value
         .pointer("/payload/output/sentence/text")
         .and_then(Value::as_str)
-        .or_else(|| value.pointer("/output/sentence/text").and_then(Value::as_str))
-        .or_else(|| value.pointer("/payload/output/text").and_then(Value::as_str))
+        .or_else(|| {
+            value
+                .pointer("/output/sentence/text")
+                .and_then(Value::as_str)
+        })
+        .or_else(|| {
+            value
+                .pointer("/payload/output/text")
+                .and_then(Value::as_str)
+        })
 }
 
 fn realtime_dictation_sessions() -> &'static Mutex<HashMap<String, RealtimeDictationSession>> {
     REALTIME_DICTATION_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn emit_realtime_dictation_event(app: &AppHandle, session_id: &str, text: Option<&str>, done: bool, error: Option<&str>) {
-    let _ = app.emit_to("main", "kero:realtime-dictation", json!({
-        "sessionId": session_id,
-        "text": text,
-        "done": done,
-        "error": error,
-    }));
+fn emit_realtime_dictation_event(
+    app: &AppHandle,
+    session_id: &str,
+    text: Option<&str>,
+    full_text: Option<&str>,
+    done: bool,
+    error: Option<&str>,
+) {
+    let _ = app.emit_to(
+        "main",
+        "kero:realtime-dictation",
+        json!({
+            "sessionId": session_id,
+            "text": text,
+            "fullText": full_text,
+            "done": done,
+            "error": error,
+        }),
+    );
+}
+
+/// 一次流式听写会话内累积的完整转写：已完成句 + 当前进行中的句子。
+/// 事件里必须带全量文本，否则前端只能拿到"当前句"，说多句时前面的句子会被覆盖。
+struct RealtimeDictationTranscript {
+    committed: String,
+    current: String,
+    last_begin_time: Option<i64>,
+}
+
+impl RealtimeDictationTranscript {
+    fn new() -> Self {
+        Self {
+            committed: String::new(),
+            current: String::new(),
+            last_begin_time: None,
+        }
+    }
+
+    fn full_text(&self) -> String {
+        format!("{}{}", self.committed, self.current)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RealtimeDictationProtocol {
+    /// qwen3-asr-*-realtime：OpenAI-realtime 风格协议（session.update / input_audio_buffer.append / server_vad）
+    QwenRealtime,
+    /// 旧 api-ws/v1/inference 双工协议（run-task / result-generated / finish-task）
+    DashScopeDuplex,
+}
+
+fn dictation_realtime_protocol(model: &str) -> RealtimeDictationProtocol {
+    let model = model.trim().to_ascii_lowercase();
+    if model.contains("qwen3-asr") && model.contains("realtime") {
+        RealtimeDictationProtocol::QwenRealtime
+    } else {
+        RealtimeDictationProtocol::DashScopeDuplex
+    }
+}
+
+fn is_stream_dictation_model(model: &str) -> bool {
+    let model = model.trim().to_ascii_lowercase();
+    model.contains("realtime") || model.contains("streaming")
+}
+
+fn is_qwen3_asr_realtime_model(model: &str) -> bool {
+    dictation_realtime_protocol(model) == RealtimeDictationProtocol::QwenRealtime
+}
+
+fn register_realtime_dictation_session(
+) -> (
+    String,
+    tokio::sync::mpsc::UnboundedReceiver<RealtimeDictationCommand>,
+) {
+    let session_id = Uuid::new_v4().to_string();
+    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    realtime_dictation_sessions()
+        .lock()
+        .unwrap()
+        .insert(session_id.clone(), RealtimeDictationSession { sender });
+    (session_id, receiver)
 }
 
 #[tauri::command]
 async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSessionStart, String> {
     let config = load_config()?.dictation_asr;
-    if !config.model.to_ascii_lowercase().contains("realtime") {
-        return Err("当前模型不是实时语音识别模型".to_string());
+    if !is_stream_dictation_model(&config.model) {
+        return Err(
+            "当前模型不是流式语音识别模型（模型名需包含 realtime 或 streaming）".to_string(),
+        );
     }
     let origin = dashscope_realtime_asr_origin(config.base_url.trim_end_matches('/'))
-        .ok_or_else(|| "实时语音识别目前仅支持 DashScope 服务地址".to_string())?;
-    let sample_rate = if config.model.to_ascii_lowercase().contains("8k") { 8_000 } else { 16_000 };
+        .ok_or_else(|| "流式语音识别目前仅支持 DashScope 服务地址".to_string())?;
+    let sample_rate = if config.model.to_ascii_lowercase().contains("8k") {
+        8_000
+    } else {
+        16_000
+    };
     let key = read_secret(DICTATION_ASR_SECRET_ID)?
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| "AI 语音识别 API Key 尚未保存".to_string())?;
+
+    if is_qwen3_asr_realtime_model(&config.model) {
+        // ---- Qwen3-ASR-Flash-Realtime：OpenAI-realtime 风格协议 ----
+        let mut request = format!("{origin}/api-ws/v1/realtime?model={}", config.model)
+            .into_client_request()
+            .map_err(|error| format!("无法准备实时语音识别请求: {error}"))?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {key}")
+                .parse()
+                .map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
+        );
+        request.headers_mut().insert(
+            "OpenAI-Beta",
+            "realtime=v1"
+                .parse()
+                .map_err(|error| format!("无法准备实时语音识别协议头: {error}"))?,
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|error| format!("无法连接实时语音识别服务: {error}"))?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "session.update",
+                    "session": {
+                        "input_audio_format": "pcm",
+                        "sample_rate": sample_rate,
+                        "input_audio_transcription": { "language": "zh" },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "silence_duration_ms": 500
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|error| format!("无法配置实时语音识别会话: {error}"))?;
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(8), socket.next())
+            .await
+            .map_err(|_| "实时语音识别启动超时".to_string())?
+            .ok_or_else(|| "实时语音识别服务提前断开".to_string())?
+            .map_err(|error| format!("实时语音识别启动失败: {error}"))?;
+        if let Message::Text(message) = confirmed {
+            let value: Value = serde_json::from_str(&message)
+                .map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
+            let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
+            if event == "error" {
+                return Err(value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("实时语音识别会话配置失败")
+                    .to_string());
+            }
+            if event != "session.created" && event != "session.updated" {
+                return Err("实时语音识别未能建立会话".to_string());
+            }
+        }
+
+        let (session_id, mut receiver) = register_realtime_dictation_session();
+        let background_app = app.clone();
+        let background_session_id = session_id.clone();
+        tauri::async_runtime::spawn(async move {
+            let (mut writer, mut reader) = socket.split();
+            let mut transcript = RealtimeDictationTranscript::new();
+            let mut finishing = false;
+            loop {
+                tokio::select! {
+                    command = receiver.recv(), if !finishing => match command {
+                        Some(RealtimeDictationCommand::Audio(frame)) => {
+                            let payload = json!({
+                                "type": "input_audio_buffer.append",
+                                "audio": BASE64.encode(&frame),
+                            })
+                            .to_string();
+                            if let Err(error) = writer.send(Message::Text(payload.into())).await {
+                                transcript.current.clear();
+                                emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法发送实时录音: {error}")));
+                                break;
+                            }
+                        }
+                        Some(RealtimeDictationCommand::Finish) | None => {
+                            finishing = true;
+                            if let Err(error) = writer.send(Message::Text(json!({ "type": "session.finish" }).to_string().into())).await {
+                                emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法结束实时语音识别: {error}")));
+                                break;
+                            }
+                        }
+                    },
+                    message = reader.next() => match message {
+                        Some(Ok(Message::Text(message))) => {
+                            let Ok(value) = serde_json::from_str::<Value>(&message) else {
+                                continue;
+                            };
+                            let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
+                            match event {
+                                "conversation.item.input_audio_transcription.text" => {
+                                    let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
+                                    let stash = value.get("stash").and_then(Value::as_str).unwrap_or_default();
+                                    let preview = format!("{text}{stash}");
+                                    let preview = preview.trim();
+                                    if !preview.is_empty() {
+                                        transcript.current = preview.to_string();
+                                        let full = transcript.full_text();
+                                        emit_realtime_dictation_event(&background_app, &background_session_id, Some(preview), Some(&full), false, None);
+                                    }
+                                }
+                                "conversation.item.input_audio_transcription.completed" => {
+                                    if let Some(segment) = value.get("transcript").and_then(Value::as_str) {
+                                        let segment = segment.trim();
+                                        if !segment.is_empty() {
+                                            transcript.committed.push_str(segment);
+                                            transcript.current.clear();
+                                            let full = transcript.full_text();
+                                            emit_realtime_dictation_event(&background_app, &background_session_id, Some(segment), Some(&full), false, None);
+                                        }
+                                    }
+                                }
+                                "conversation.item.input_audio_transcription.failed" => {
+                                    let message = value
+                                        .pointer("/error/message")
+                                        .and_then(Value::as_str)
+                                        .or_else(|| value.get("message").and_then(Value::as_str))
+                                        .unwrap_or("实时语音识别转写失败");
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(message));
+                                    break;
+                                }
+                                "error" => {
+                                    let message = value
+                                        .pointer("/error/message")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("实时语音识别出现错误");
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(message));
+                                    break;
+                                }
+                                "session.finished" => {
+                                    let full = transcript.full_text();
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&full), true, None);
+                                    break;
+                                }
+                                _ => {}
+                            }
+                        }
+                        Some(Ok(Message::Ping(payload))) => { let _ = writer.send(Message::Pong(payload)).await; }
+                        Some(Ok(_)) => {}
+                        Some(Err(error)) => {
+                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("读取实时语音识别结果失败: {error}")));
+                            break;
+                        }
+                        None => {
+                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some("实时语音识别服务已断开"));
+                            break;
+                        }
+                    }
+                }
+            }
+            realtime_dictation_sessions()
+                .lock()
+                .unwrap()
+                .remove(&background_session_id);
+        });
+        return Ok(RealtimeDictationSessionStart {
+            session_id,
+            sample_rate,
+        });
+    }
+
+    // ---- 旧 DashScope 双工协议（run-task / finish-task）----
     let mut request = format!("{origin}/api-ws/v1/inference")
         .into_client_request()
         .map_err(|error| format!("无法准备实时语音识别请求: {error}"))?;
     request.headers_mut().insert(
         "Authorization",
-        format!("Bearer {key}").parse().map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
+        format!("Bearer {key}")
+            .parse()
+            .map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
     );
     let (mut socket, _) = connect_async(request)
         .await
         .map_err(|error| format!("无法连接实时语音识别服务: {error}"))?;
     let task_id = Uuid::new_v4().simple().to_string();
-    socket.send(Message::Text(json!({
-        "header": { "task_id": task_id, "action": "run-task", "streaming": "duplex" },
-        "payload": {
-            "model": config.model,
-            "task_group": "audio",
-            "task": "asr",
-            "function": "recognition",
-            "input": {},
-            "parameters": { "format": "pcm", "sample_rate": sample_rate }
-        }
-    }).to_string().into())).await
+    socket
+        .send(Message::Text(
+            json!({
+                "header": { "task_id": task_id, "action": "run-task", "streaming": "duplex" },
+                "payload": {
+                    "model": config.model,
+                    "task_group": "audio",
+                    "task": "asr",
+                    "function": "recognition",
+                    "input": {},
+                    "parameters": { "format": "pcm", "sample_rate": sample_rate }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
         .map_err(|error| format!("无法启动实时语音识别: {error}"))?;
     let started = tokio::time::timeout(std::time::Duration::from_secs(8), socket.next())
         .await
         .map_err(|_| "实时语音识别启动超时".to_string())?
         .ok_or_else(|| "实时语音识别服务提前断开".to_string())?
         .map_err(|error| format!("实时语音识别启动失败: {error}"))?;
-    let started = started.into_text().map_err(|_| "实时语音识别返回了无效启动响应".to_string())?;
-    let started: Value = serde_json::from_str(&started).map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
+    let started = started
+        .into_text()
+        .map_err(|_| "实时语音识别返回了无效启动响应".to_string())?;
+    let started: Value =
+        serde_json::from_str(&started).map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
     match started.pointer("/header/event").and_then(Value::as_str) {
         Some("task-started") => {}
-        Some("task-failed") => return Err(started.pointer("/header/error_message").and_then(Value::as_str).unwrap_or("实时语音识别启动失败").to_string()),
+        Some("task-failed") => {
+            return Err(started
+                .pointer("/header/error_message")
+                .and_then(Value::as_str)
+                .unwrap_or("实时语音识别启动失败")
+                .to_string())
+        }
         _ => return Err("实时语音识别未能启动任务".to_string()),
     }
 
-    let session_id = Uuid::new_v4().to_string();
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    realtime_dictation_sessions().lock().unwrap().insert(session_id.clone(), RealtimeDictationSession { sender });
+    let (session_id, mut receiver) = register_realtime_dictation_session();
     let background_app = app.clone();
     let background_session_id = session_id.clone();
     tauri::async_runtime::spawn(async move {
         let (mut writer, mut reader) = socket.split();
+        let mut transcript = RealtimeDictationTranscript::new();
         let mut finishing = false;
         loop {
             tokio::select! {
                 command = receiver.recv(), if !finishing => match command {
                     Some(RealtimeDictationCommand::Audio(frame)) => {
                         if let Err(error) = writer.send(Message::Binary(frame.into())).await {
-                            emit_realtime_dictation_event(&background_app, &background_session_id, None, true, Some(&format!("无法发送实时录音: {error}")));
+                            transcript.current.clear();
+                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法发送实时录音: {error}")));
                             break;
                         }
                     }
@@ -1872,7 +2304,7 @@ async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSes
                             "header": { "task_id": task_id, "action": "finish-task", "streaming": "duplex" },
                             "payload": { "input": {} }
                         }).to_string().into())).await {
-                            emit_realtime_dictation_event(&background_app, &background_session_id, None, true, Some(&format!("无法结束实时语音识别: {error}")));
+                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法结束实时语音识别: {error}")));
                             break;
                         }
                     }
@@ -1883,14 +2315,31 @@ async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSes
                             Ok(value) => {
                                 let event = value.pointer("/header/event").and_then(Value::as_str).unwrap_or_default();
                                 if event == "task-failed" {
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, true, value.pointer("/header/error_message").and_then(Value::as_str));
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, value.pointer("/header/error_message").and_then(Value::as_str));
                                     break;
                                 }
                                 if let Some(text) = dictation_realtime_text(&value).map(str::trim).filter(|text| !text.is_empty()) {
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, Some(text), false, None);
+                                    // 每个事件只带"当前句"，句子切换（begin_time 变化）时把上一句转入 committed，
+                                    // 否则前端整段替换会把已上屏的前几句覆盖掉。
+                                    let begin_time = value
+                                        .pointer("/payload/output/sentence/begin_time")
+                                        .or_else(|| value.pointer("/output/sentence/begin_time"))
+                                        .and_then(Value::as_i64);
+                                    if let Some(begin_time) = begin_time {
+                                        if transcript.last_begin_time.is_some_and(|previous| previous != begin_time)
+                                            && !transcript.current.is_empty()
+                                        {
+                                            transcript.committed.push_str(&transcript.current);
+                                        }
+                                        transcript.last_begin_time = Some(begin_time);
+                                    }
+                                    transcript.current = text.to_string();
+                                    let full = transcript.full_text();
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, Some(text), Some(&full), false, None);
                                 }
                                 if event == "task-finished" {
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, true, None);
+                                    let full = transcript.full_text();
+                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&full), true, None);
                                     break;
                                 }
                             }
@@ -1900,49 +2349,76 @@ async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSes
                     Some(Ok(Message::Ping(payload))) => { let _ = writer.send(Message::Pong(payload)).await; }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => {
-                        emit_realtime_dictation_event(&background_app, &background_session_id, None, true, Some(&format!("读取实时语音识别结果失败: {error}")));
+                        emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("读取实时语音识别结果失败: {error}")));
                         break;
                     }
                     None => {
-                        emit_realtime_dictation_event(&background_app, &background_session_id, None, true, Some("实时语音识别服务已断开"));
+                        emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some("实时语音识别服务已断开"));
                         break;
                     }
                 }
             }
         }
-        realtime_dictation_sessions().lock().unwrap().remove(&background_session_id);
+        realtime_dictation_sessions()
+            .lock()
+            .unwrap()
+            .remove(&background_session_id);
     });
-    Ok(RealtimeDictationSessionStart { session_id, sample_rate })
+    Ok(RealtimeDictationSessionStart {
+        session_id,
+        sample_rate,
+    })
 }
 
 #[tauri::command]
 fn push_realtime_dictation_audio(session_id: String, pcm_base64: String) -> Result<(), String> {
-    let frame = BASE64.decode(pcm_base64.trim()).map_err(|_| "无法读取实时录音数据".to_string())?;
-    if frame.is_empty() { return Ok(()); }
-    let sender = realtime_dictation_sessions().lock().unwrap().get(&session_id)
+    let frame = BASE64
+        .decode(pcm_base64.trim())
+        .map_err(|_| "无法读取实时录音数据".to_string())?;
+    if frame.is_empty() {
+        return Ok(());
+    }
+    let sender = realtime_dictation_sessions()
+        .lock()
+        .unwrap()
+        .get(&session_id)
         .map(|session| session.sender.clone())
         .ok_or_else(|| "实时语音识别会话已结束".to_string())?;
-    sender.send(RealtimeDictationCommand::Audio(frame)).map_err(|_| "实时语音识别会话已结束".to_string())
+    sender
+        .send(RealtimeDictationCommand::Audio(frame))
+        .map_err(|_| "实时语音识别会话已结束".to_string())
 }
 
 #[tauri::command]
 fn finish_realtime_dictation(session_id: String) -> Result<(), String> {
-    let sender = realtime_dictation_sessions().lock().unwrap().get(&session_id)
+    let sender = realtime_dictation_sessions()
+        .lock()
+        .unwrap()
+        .get(&session_id)
         .map(|session| session.sender.clone())
         .ok_or_else(|| "实时语音识别会话已结束".to_string())?;
-    sender.send(RealtimeDictationCommand::Finish).map_err(|_| "实时语音识别会话已结束".to_string())
+    sender
+        .send(RealtimeDictationCommand::Finish)
+        .map_err(|_| "实时语音识别会话已结束".to_string())
 }
 
 #[tauri::command]
-async fn transcribe_realtime_dictation_audio(pcm_base64: String, sample_rate: u32) -> Result<String, String> {
+async fn transcribe_realtime_dictation_audio(
+    pcm_base64: String,
+    sample_rate: u32,
+) -> Result<String, String> {
     let config = load_config()?.dictation_asr;
     let base_url = config.base_url.trim_end_matches('/');
-    if !config.model.contains("realtime") {
-        return Err("当前模型不是实时语音识别模型".to_string());
+    if !is_stream_dictation_model(&config.model) {
+        return Err("当前模型不是流式语音识别模型（模型名需包含 realtime 或 streaming）".to_string());
     }
     let origin = dashscope_realtime_asr_origin(base_url)
-        .ok_or_else(|| "实时语音识别当前仅支持 DashScope 服务地址".to_string())?;
-    let expected_rate = if config.model.contains("8k") { 8_000 } else { 16_000 };
+        .ok_or_else(|| "流式语音识别当前仅支持 DashScope 服务地址".to_string())?;
+    let expected_rate = if config.model.contains("8k") {
+        8_000
+    } else {
+        16_000
+    };
     if sample_rate != expected_rate {
         return Err(format!("当前模型要求 {expected_rate} Hz PCM 音频"));
     }
@@ -1956,6 +2432,119 @@ async fn transcribe_realtime_dictation_audio(pcm_base64: String, sample_rate: u3
         return Err("录音为空或超过 12 MB 限制，请缩短单次听写".to_string());
     }
 
+    if is_qwen3_asr_realtime_model(&config.model) {
+        // ---- Qwen3-ASR-Flash-Realtime 协议回放 ----
+        let mut request = format!("{origin}/api-ws/v1/realtime?model={}", config.model)
+            .into_client_request()
+            .map_err(|error| format!("无法准备实时语音识别请求: {error}"))?;
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {key}")
+                .parse()
+                .map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
+        );
+        request.headers_mut().insert(
+            "OpenAI-Beta",
+            "realtime=v1"
+                .parse()
+                .map_err(|error| format!("无法准备实时语音识别协议头: {error}"))?,
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .map_err(|error| format!("无法连接实时语音识别服务: {error}"))?;
+        socket
+            .send(Message::Text(
+                json!({
+                    "type": "session.update",
+                    "session": {
+                        "input_audio_format": "pcm",
+                        "sample_rate": sample_rate,
+                        "input_audio_transcription": { "language": "zh" },
+                        "turn_detection": {
+                            "type": "server_vad",
+                            "silence_duration_ms": 500
+                        }
+                    }
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .map_err(|error| format!("无法配置实时语音识别会话: {error}"))?;
+
+        let mut committed = String::new();
+        let mut current = String::new();
+        // 逐块回放；与实时路径不同，这里音频是整段现成的，发送与接收并行推进。
+        let mut audio_offset = 0usize;
+        let mut finish_sent = false;
+        let (mut writer, mut reader) = socket.split();
+        loop {
+            tokio::select! {
+                send_done = async {
+                    if audio_offset < audio.len() {
+                        let end = (audio_offset + 6_400).min(audio.len());
+                        let payload = json!({
+                            "type": "input_audio_buffer.append",
+                            "audio": BASE64.encode(&audio[audio_offset..end]),
+                        })
+                        .to_string();
+                        audio_offset = end;
+                        writer.send(Message::Text(payload.into())).await
+                    } else {
+                        finish_sent = true;
+                        writer.send(Message::Text(json!({ "type": "session.finish" }).to_string().into())).await
+                    }
+                }, if !finish_sent => {
+                    send_done.map_err(|error| format!("无法发送实时录音: {error}"))?;
+                }
+                message = reader.next() => {
+                    let message = message
+                        .ok_or_else(|| "实时语音识别服务提前断开".to_string())?
+                        .map_err(|error| format!("读取实时语音识别结果失败: {error}"))?;
+                    if let Message::Text(message) = message {
+                        let Ok(value) = serde_json::from_str::<Value>(&message) else { continue };
+                        let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
+                        match event {
+                            "conversation.item.input_audio_transcription.text" => {
+                                let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
+                                let stash = value.get("stash").and_then(Value::as_str).unwrap_or_default();
+                                let preview = format!("{text}{stash}");
+                                current = preview.trim().to_string();
+                            }
+                            "conversation.item.input_audio_transcription.completed" => {
+                                if let Some(segment) = value.get("transcript").and_then(Value::as_str) {
+                                    let segment = segment.trim();
+                                    if !segment.is_empty() {
+                                        committed.push_str(segment);
+                                        current.clear();
+                                    }
+                                }
+                            }
+                            "conversation.item.input_audio_transcription.failed" | "error" => {
+                                return Err(value
+                                    .pointer("/error/message")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| value.get("message").and_then(Value::as_str))
+                                    .unwrap_or("实时语音识别失败")
+                                    .to_string());
+                            }
+                            "session.finished" => {
+                                let text = format!("{committed}{current}");
+                                let text = text.trim().to_string();
+                                if text.is_empty() {
+                                    return Err("实时语音识别没有听到有效内容".to_string());
+                                }
+                                return Ok(text);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 旧 DashScope 双工协议回放 ----
     let mut request = format!("{origin}/api-ws/v1/inference")
         .into_client_request()
         .map_err(|error| format!("无法准备实时语音识别请求: {error}"))?;
@@ -1993,12 +2582,24 @@ async fn transcribe_realtime_dictation_audio(pcm_base64: String, sample_rate: u3
     let started = started
         .into_text()
         .map_err(|_| "实时语音识别返回了无效启动响应".to_string())?;
-    let started_json: Value = serde_json::from_str(&started)
-        .map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
-    if started_json.pointer("/header/event").and_then(Value::as_str) == Some("task-failed") {
-        return Err(started_json.pointer("/header/error_message").and_then(Value::as_str).unwrap_or("实时语音识别启动失败").to_string());
+    let started_json: Value =
+        serde_json::from_str(&started).map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
+    if started_json
+        .pointer("/header/event")
+        .and_then(Value::as_str)
+        == Some("task-failed")
+    {
+        return Err(started_json
+            .pointer("/header/error_message")
+            .and_then(Value::as_str)
+            .unwrap_or("实时语音识别启动失败")
+            .to_string());
     }
-    if started_json.pointer("/header/event").and_then(Value::as_str) != Some("task-started") {
+    if started_json
+        .pointer("/header/event")
+        .and_then(Value::as_str)
+        != Some("task-started")
+    {
         return Err("实时语音识别未能启动任务".to_string());
     }
 
@@ -2027,9 +2628,16 @@ async fn transcribe_realtime_dictation_audio(pcm_base64: String, sample_rate: u3
         if let Message::Text(message) = message {
             let value: Value = serde_json::from_str(&message)
                 .map_err(|_| "实时语音识别返回了无效结果".to_string())?;
-            let event = value.pointer("/header/event").and_then(Value::as_str).unwrap_or_default();
+            let event = value
+                .pointer("/header/event")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if event == "task-failed" {
-                return Err(value.pointer("/header/error_message").and_then(Value::as_str).unwrap_or("实时语音识别失败").to_string());
+                return Err(value
+                    .pointer("/header/error_message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("实时语音识别失败")
+                    .to_string());
             }
             if let Some(segment) = dictation_realtime_text(&value) {
                 if !segment.trim().is_empty() {
@@ -2335,9 +2943,10 @@ fn publish_mcp_decision(
         _ => return Err("Unsupported MCP decision phase".to_string()),
     };
     let truncate = |value: Option<&str>, limit: usize| {
-        value.map(str::trim).filter(|value| !value.is_empty()).map(|value| {
-            value.chars().take(limit).collect::<String>()
-        })
+        value
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.chars().take(limit).collect::<String>())
     };
     let payload = json!({
         "active": active,
@@ -2348,7 +2957,8 @@ fn publish_mcp_decision(
     });
     if let Some(main) = app.get_webview_window("main") {
         main.show().map_err(|error| error.to_string())?;
-        main.set_skip_taskbar(true).map_err(|error| error.to_string())?;
+        main.set_skip_taskbar(true)
+            .map_err(|error| error.to_string())?;
     }
     app.emit_to("main", "kero:mcp-decision", payload.clone())
         .map_err(|error| error.to_string())?;
@@ -2528,7 +3138,8 @@ fn handle_mcp_bridge_request(app: &AppHandle, request: McpBridgeRequest) -> Valu
                 tauri::async_runtime::block_on(async {
                     let mut messages = Vec::with_capacity(actions.len());
                     for action in actions {
-                        messages.push(computer_execute_action(app.clone(), action, Some(true)).await?);
+                        messages
+                            .push(computer_execute_action(app.clone(), action, Some(true)).await?);
                     }
                     Ok::<_, String>(json!({ "messages": messages }))
                 })
@@ -2912,8 +3523,7 @@ fn generated_images_path(app: &AppHandle) -> Result<PathBuf, String> {
         .app_local_data_dir()
         .map_err(|error| format!("无法找到图片保存目录: {error}"))?
         .join("generated-images");
-    fs::create_dir_all(&directory)
-        .map_err(|error| format!("无法创建图片保存目录: {error}"))?;
+    fs::create_dir_all(&directory).map_err(|error| format!("无法创建图片保存目录: {error}"))?;
     Ok(directory)
 }
 
@@ -2923,8 +3533,14 @@ fn available_download_path(directory: &std::path::Path, filename: &str) -> PathB
         return candidate;
     }
     let source = std::path::Path::new(filename);
-    let stem = source.file_stem().and_then(|value| value.to_str()).unwrap_or("Kero 图片");
-    let extension = source.extension().and_then(|value| value.to_str()).unwrap_or("png");
+    let stem = source
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Kero 图片");
+    let extension = source
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or("png");
     for index in 2..10_000 {
         let candidate = directory.join(format!("{stem} ({index}).{extension}"));
         if !candidate.exists() {
@@ -3057,8 +3673,7 @@ async fn complete_openai_with_attachments(
     if !status.is_success() {
         return Err(api_error(status, &body));
     }
-    openai_message_text(&body)
-        .ok_or_else(|| "模型响应中没有可显示的内容".to_string())
+    openai_message_text(&body).ok_or_else(|| "模型响应中没有可显示的内容".to_string())
 }
 
 fn image_response_preview(bytes: &[u8]) -> String {
@@ -3093,7 +3708,9 @@ fn parse_image_generation_json(bytes: &[u8]) -> Result<Value, String> {
     Err("response is not JSON".to_string())
 }
 
-async fn read_image_generation_response(response: reqwest::Response) -> Result<(reqwest::StatusCode, Value), String> {
+async fn read_image_generation_response(
+    response: reqwest::Response,
+) -> Result<(reqwest::StatusCode, Value), String> {
     let status = response.status();
     let content_type = response
         .headers()
@@ -3116,7 +3733,10 @@ async fn read_image_generation_response(response: reqwest::Response) -> Result<(
         if bytes.is_empty() || bytes.len() > MAX_GENERATED_IMAGE_BYTES {
             return Err("图片生成服务直接返回的图片大小无效".to_string());
         }
-        return Ok((status, json!({ "data": [{ "b64_json": BASE64.encode(bytes) }] })));
+        return Ok((
+            status,
+            json!({ "data": [{ "b64_json": BASE64.encode(bytes) }] }),
+        ));
     }
     match parse_image_generation_json(&bytes) {
         Ok(body) => Ok((status, body)),
@@ -3143,10 +3763,7 @@ fn image_data_items(body: &Value) -> Option<&Vec<Value>> {
 }
 
 async fn image_bytes_from_response(body: &Value) -> Result<Vec<u8>, String> {
-    if let Some(encoded) = body
-        .pointer("/data/0/b64_json")
-        .and_then(Value::as_str)
-    {
+    if let Some(encoded) = body.pointer("/data/0/b64_json").and_then(Value::as_str) {
         let bytes = BASE64
             .decode(encoded)
             .map_err(|_| "图片服务返回了无效的图片数据".to_string())?;
@@ -3180,7 +3797,10 @@ async fn image_bytes_from_response(body: &Value) -> Result<Vec<u8>, String> {
 }
 
 #[tauri::command]
-async fn generate_image(app: AppHandle, request: ImageGenerationRequest) -> Result<Vec<GeneratedImage>, String> {
+async fn generate_image(
+    app: AppHandle,
+    request: ImageGenerationRequest,
+) -> Result<Vec<GeneratedImage>, String> {
     let prompt = request.prompt.trim();
     if prompt.is_empty() {
         return Err("请输入图片描述".to_string());
@@ -4136,15 +4756,13 @@ async fn optimize_image_prompt(request: ImagePromptOptimizationRequest) -> Resul
         }
     } else {
         if !matches!(provider.kind.as_str(), "openai" | "compatible") {
-            return Err("带图片素材优化提示词需要使用支持视觉输入的 OpenAI 协议模型或兼容接口".to_string());
+            return Err(
+                "带图片素材优化提示词需要使用支持视觉输入的 OpenAI 协议模型或兼容接口".to_string(),
+            );
         }
         complete_openai_with_attachments(&client, &provider, &key, &messages, &attachments).await
     }?;
-    Ok(result
-        .trim()
-        .trim_matches('`')
-        .trim()
-        .to_string())
+    Ok(result.trim().trim_matches('`').trim().to_string())
 }
 
 fn openai_message_text(body: &Value) -> Option<String> {
@@ -4287,22 +4905,33 @@ async fn request_screen_text_translation(
                 provider,
                 key,
                 &[
-                    ChatMessage { role: "system".to_string(), content: system.to_string() },
-                    ChatMessage { role: "user".to_string(), content: prompt },
+                    ChatMessage {
+                        role: "system".to_string(),
+                        content: system.to_string(),
+                    },
+                    ChatMessage {
+                        role: "user".to_string(),
+                        content: prompt,
+                    },
                 ],
             )
             .await?
         }
         "google" => {
-            let body = send_google_translation_json(provider, key, json!({
-                "systemInstruction": { "parts": [{ "text": system }] },
-                "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
-                "generationConfig": {
-                    "temperature": 0,
-                    "maxOutputTokens": 2048,
-                    "thinkingConfig": { "thinkingBudget": 0 }
-                }
-            })).await?;
+            let body = send_google_translation_json(
+                provider,
+                key,
+                json!({
+                    "systemInstruction": { "parts": [{ "text": system }] },
+                    "contents": [{ "role": "user", "parts": [{ "text": prompt }] }],
+                    "generationConfig": {
+                        "temperature": 0,
+                        "maxOutputTokens": 2048,
+                        "thinkingConfig": { "thinkingBudget": 0 }
+                    }
+                }),
+            )
+            .await?;
             body.pointer("/candidates/0/content/parts/0/text")
                 .and_then(Value::as_str)
                 .map(str::to_string)
@@ -4365,11 +4994,11 @@ async fn request_screen_translation(
     let prompt = screen_translation_prompt(settings);
     let client = shared_http_client();
     let content = match provider.kind.as_str() {
-            "anthropic" => {
-                let (_, encoded) = screen_image
-                    .split_once(',')
-                    .ok_or_else(|| "屏幕图像数据无效。".to_string())?;
-                let response = client
+        "anthropic" => {
+            let (_, encoded) = screen_image
+                .split_once(',')
+                .ok_or_else(|| "屏幕图像数据无效。".to_string())?;
+            let response = client
                     .post(endpoint(
                         &provider.base_url,
                         "https://api.anthropic.com",
@@ -4389,17 +5018,23 @@ async fn request_screen_translation(
                     .send()
                     .await
                     .map_err(|error| format!("无法连接屏幕翻译模型: {error}"))?;
-                let status = response.status();
-                let body = response.json::<Value>().await
-                    .map_err(|error| format!("无法读取屏幕翻译响应: {error}"))?;
-                if !status.is_success() { return Err(api_error(status, &body)); }
-                body.pointer("/content/0/text").and_then(Value::as_str).map(str::to_string)
+            let status = response.status();
+            let body = response
+                .json::<Value>()
+                .await
+                .map_err(|error| format!("无法读取屏幕翻译响应: {error}"))?;
+            if !status.is_success() {
+                return Err(api_error(status, &body));
             }
-            "google" => {
-                let (_, encoded) = screen_image
-                    .split_once(',')
-                    .ok_or_else(|| "屏幕图像数据无效。".to_string())?;
-                let body = send_google_translation_json(provider, key, json!({
+            body.pointer("/content/0/text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        "google" => {
+            let (_, encoded) = screen_image
+                .split_once(',')
+                .ok_or_else(|| "屏幕图像数据无效。".to_string())?;
+            let body = send_google_translation_json(provider, key, json!({
                         "systemInstruction": { "parts": [{ "text": "你是低延迟屏幕翻译器。直接翻译，不进行分析或扩展思考，只输出请求的 JSON。" }] },
                         "contents": [{ "role": "user", "parts": [
                             { "inlineData": { "mimeType": "image/jpeg", "data": encoded } },
@@ -4407,10 +5042,12 @@ async fn request_screen_translation(
                         ] }],
                         "generationConfig": { "temperature": 0, "maxOutputTokens": 2400, "thinkingConfig": { "thinkingBudget": 0 } }
                     })).await?;
-                body.pointer("/candidates/0/content/parts/0/text").and_then(Value::as_str).map(str::to_string)
-            }
-            _ => {
-                let body = send_openai_translation_json(provider, key, json!({
+            body.pointer("/candidates/0/content/parts/0/text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        _ => {
+            let body = send_openai_translation_json(provider, key, json!({
                         "model": provider.model,
                         "messages": [
                             { "role": "system", "content": "你是低延迟屏幕翻译器。直接翻译，不进行分析或扩展思考，只输出请求的 JSON。" },
@@ -4424,12 +5061,11 @@ async fn request_screen_translation(
                         "reasoning_effort": "none",
                         "max_tokens": 2400
                     })).await?;
-                openai_message_text(&body)
-            }
-        };
-    let content = content.ok_or_else(|| {
-        "当前模型没有返回屏幕翻译结果，可能不支持图片识别。".to_string()
-    })?;
+            openai_message_text(&body)
+        }
+    };
+    let content =
+        content.ok_or_else(|| "当前模型没有返回屏幕翻译结果，可能不支持图片识别。".to_string())?;
     let json_text = first_complete_json_object(&content)
         .ok_or_else(|| "屏幕翻译模型没有返回有效 JSON。".to_string())?;
     let mut translated: ScreenTranslationResponse = serde_json::from_str(json_text)
@@ -4644,7 +5280,8 @@ async fn optimize_dictation(
     vocabulary: Option<String>,
     memory: Option<String>,
 ) -> Result<String, String> {
-    dictation::optimize_dictation(text, correct_typos, vocabulary, memory).await
+    let optimized = dictation::optimize_dictation(text, correct_typos, vocabulary, memory).await?;
+    Ok(dictation::normalize_dictation_punctuation(&optimized))
 }
 
 #[tauri::command]
@@ -4653,41 +5290,61 @@ async fn warm_dictation_service() -> Result<(), String> {
 }
 
 async fn warm_dictation_service_inner() -> Result<(), String> {
-    let request = ChatRequest {
-        provider_id: None,
-        messages: Vec::new(),
-        attachments: Vec::new(),
-        screen_image: None,
-        web_search: false,
+    // 润色走聊天模型，ASR 走 DashScope；两条链路并行预热。
+    let polish_warm = async {
+        let request = ChatRequest {
+            provider_id: None,
+            messages: Vec::new(),
+            attachments: Vec::new(),
+            screen_image: None,
+            web_search: false,
+        };
+        let Ok((provider, key, _, _)) = resolve_chat_provider(&request) else {
+            return;
+        };
+        let client = shared_http_client();
+        let request = match provider.kind.as_str() {
+            "anthropic" => client
+                .head(endpoint(
+                    &provider.base_url,
+                    "https://api.anthropic.com",
+                    "/v1/messages",
+                ))
+                .header("x-api-key", key)
+                .header("anthropic-version", "2023-06-01"),
+            "google" => {
+                let base = if provider.base_url.trim().is_empty() {
+                    "https://generativelanguage.googleapis.com"
+                } else {
+                    provider.base_url.trim_end_matches('/')
+                };
+                client.head(format!("{base}/v1beta/models?key={key}"))
+            }
+            _ => client
+                .head(endpoint(
+                    &provider.base_url,
+                    "https://api.openai.com",
+                    "/v1/models",
+                ))
+                .bearer_auth(key),
+        };
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1_500), request.send()).await;
     };
-    let (provider, key, _, _) = resolve_chat_provider(&request)?;
-    let client = shared_http_client();
-    let request = match provider.kind.as_str() {
-        "anthropic" => client
-            .head(endpoint(
-                &provider.base_url,
-                "https://api.anthropic.com",
-                "/v1/messages",
-            ))
-            .header("x-api-key", key)
-            .header("anthropic-version", "2023-06-01"),
-        "google" => {
-            let base = if provider.base_url.trim().is_empty() {
-                "https://generativelanguage.googleapis.com"
-            } else {
-                provider.base_url.trim_end_matches('/')
-            };
-            client.head(format!("{base}/v1beta/models?key={key}"))
-        }
-        _ => client
-            .head(endpoint(
-                &provider.base_url,
-                "https://api.openai.com",
-                "/v1/models",
-            ))
-            .bearer_auth(key),
+    let asr_warm = async {
+        let Ok(config) = load_config() else {
+            return;
+        };
+        let Some(origin) = dashscope_asr_origin(config.dictation_asr.base_url.trim_end_matches('/'))
+        else {
+            return;
+        };
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(1_200),
+            shared_http_client().head(origin).send(),
+        )
+        .await;
     };
-    let _ = tokio::time::timeout(std::time::Duration::from_millis(1_500), request.send()).await;
+    let ((), ()) = tokio::join!(polish_warm, asr_warm);
     Ok(())
 }
 
@@ -4871,9 +5528,8 @@ async fn observe_computer_state(
     mark: Option<ComputerMark>,
 ) -> Result<(String, Option<SemanticSnapshot>, String), String> {
     let capture_app = app.clone();
-    let capture = tokio::task::spawn_blocking(move || {
-        capture_computer_control_screen(&capture_app, mark)
-    });
+    let capture =
+        tokio::task::spawn_blocking(move || capture_computer_control_screen(&capture_app, mark));
     let semantics = tokio::task::spawn_blocking(|| foreground_semantic_snapshot().ok());
     let windows = tokio::task::spawn_blocking(visible_window_inventory);
     let tray = tokio::task::spawn_blocking(system_tray_inventory);
@@ -5037,8 +5693,8 @@ unsafe extern "system" fn collect_visible_window(
     if !minimized && (visible_width < 2 || visible_height < 2) {
         return 1;
     }
-    let full_area = ((rect.right - rect.left).max(1) as f64)
-        * ((rect.bottom - rect.top).max(1) as f64);
+    let full_area =
+        ((rect.right - rect.left).max(1) as f64) * ((rect.bottom - rect.top).max(1) as f64);
     let visible_area = visible_width as f64 * visible_height as f64;
     let windows = &mut *(context as *mut Vec<VisibleWindowObservation>);
     windows.push(VisibleWindowObservation {
@@ -5056,8 +5712,13 @@ unsafe extern "system" fn collect_visible_window(
         left: ((clipped_left - screen_left) as f64 / screen_width.max(1) as f64).clamp(0.0, 1.0),
         top: ((clipped_top - screen_top) as f64 / screen_height.max(1) as f64).clamp(0.0, 1.0),
         right: ((clipped_right - screen_left) as f64 / screen_width.max(1) as f64).clamp(0.0, 1.0),
-        bottom: ((clipped_bottom - screen_top) as f64 / screen_height.max(1) as f64).clamp(0.0, 1.0),
-        visible_fraction: if minimized { 0.0 } else { visible_area / full_area },
+        bottom: ((clipped_bottom - screen_top) as f64 / screen_height.max(1) as f64)
+            .clamp(0.0, 1.0),
+        visible_fraction: if minimized {
+            0.0
+        } else {
+            visible_area / full_area
+        },
         foreground: hwnd == GetForegroundWindow(),
     });
     1
@@ -5069,7 +5730,10 @@ fn visible_windows() -> Vec<VisibleWindowObservation> {
 
     let mut windows: Vec<VisibleWindowObservation> = Vec::new();
     unsafe {
-        EnumWindows(Some(collect_visible_window), (&mut windows as *mut Vec<_>) as isize);
+        EnumWindows(
+            Some(collect_visible_window),
+            (&mut windows as *mut Vec<_>) as isize,
+        );
     }
     windows.sort_by(|left, right| {
         right
@@ -5182,11 +5846,9 @@ fn named_controls_for_window(
         ) {
             continue;
         }
-        let x = ((rect.get_left() + rect.get_width() / 2) as f64
-            / screen_width.max(1) as f64)
+        let x = ((rect.get_left() + rect.get_width() / 2) as f64 / screen_width.max(1) as f64)
             .clamp(0.0, 1.0);
-        let y = ((rect.get_top() + rect.get_height() / 2) as f64
-            / screen_height.max(1) as f64)
+        let y = ((rect.get_top() + rect.get_height() / 2) as f64 / screen_height.max(1) as f64)
             .clamp(0.0, 1.0);
         controls.push(format!(
             "- name={} | type={} | point=({:.3},{:.3}) | source={}",
@@ -5273,7 +5935,10 @@ fn focus_or_maximize_window(target: &str, maximize: bool) -> Result<&'static str
 
     let window = resolve_visible_window(target)?;
     unsafe {
-        ShowWindow(window.handle, if maximize { SW_MAXIMIZE } else { SW_RESTORE });
+        ShowWindow(
+            window.handle,
+            if maximize { SW_MAXIMIZE } else { SW_RESTORE },
+        );
         BringWindowToTop(window.handle);
         SetForegroundWindow(window.handle);
     }
@@ -5382,7 +6047,10 @@ fn semantic_snapshot_fingerprint(
         update(&control.id);
         update(&control.name);
         update(&control.control_type);
-        update(&format!("{:.2}:{:.2}:{}", control.x, control.y, control.enabled));
+        update(&format!(
+            "{:.2}:{:.2}:{}",
+            control.x, control.y, control.enabled
+        ));
     }
     format!("{hash:016x}")
 }
@@ -5560,10 +6228,10 @@ fn foreground_screen_text() -> Vec<DetectedScreenText> {
             Ok(rect) if rect.get_width() > 3 && rect.get_height() > 3 => rect,
             _ => continue,
         };
-        let left = ((rect.get_left() - screen_left) as f64 / screen_width.max(1) as f64)
-            .clamp(0.0, 1.0);
-        let top = ((rect.get_top() - screen_top) as f64 / screen_height.max(1) as f64)
-            .clamp(0.0, 1.0);
+        let left =
+            ((rect.get_left() - screen_left) as f64 / screen_width.max(1) as f64).clamp(0.0, 1.0);
+        let top =
+            ((rect.get_top() - screen_top) as f64 / screen_height.max(1) as f64).clamp(0.0, 1.0);
         let width = (rect.get_width() as f64 / screen_width.max(1) as f64)
             .min(1.0 - left)
             .max(0.001);
@@ -5768,7 +6436,13 @@ fn try_semantic_control_action(action: &ComputerAction) -> Result<Option<&'stati
         "focus" => element
             .set_focus()
             .map_err(|error| format!("UIA_FOCUS_FAILED:{error}"))
-            .map(|_| if action.action == "type" { "uia_focus_for_type" } else { "uia_focus" }),
+            .map(|_| {
+                if action.action == "type" {
+                    "uia_focus_for_type"
+                } else {
+                    "uia_focus"
+                }
+            }),
         "" | "invoke" => {
             if action.action == "type" {
                 element
@@ -5948,10 +6622,7 @@ fn wait_for_application_window(
     while std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(100));
         let foreground = unsafe { GetForegroundWindow() };
-        if foreground.is_null()
-            || foreground == desktop_root
-            || foreground == previous_foreground
-        {
+        if foreground.is_null() || foreground == desktop_root || foreground == previous_foreground {
             continue;
         }
         let mut process_id = 0u32;
@@ -6418,9 +7089,7 @@ fn parse_computer_action(value: &str) -> Result<ComputerAction, String> {
             "click"
         }
         "openapp" => "open_app",
-        "activatewindow" | "activate_window" | "focuswindow" | "focus_window" => {
-            "activate_window"
-        }
+        "activatewindow" | "activate_window" | "focuswindow" | "focus_window" => "activate_window",
         "maximizewindow" | "maximize_window" | "maximisewindow" | "maximise_window" => {
             "maximize_window"
         }
@@ -6577,7 +7246,8 @@ async fn computer_next_action(
         return Err("当前电脑操控先支持 OpenAI 协议及其兼容中转站。".to_string());
     }
     let (mark, observation_sequence) = take_computer_mark_observation();
-    let (screen_image, semantic_snapshot, desktop_index) = observe_computer_state(&app, mark).await?;
+    let (screen_image, semantic_snapshot, desktop_index) =
+        observe_computer_state(&app, mark).await?;
     if let Some(mark) = mark {
         if matches!(mark.kind, ComputerMarkKind::Mistake) {
             remember_mark_correction(mark, semantic_snapshot.as_ref());
@@ -6720,7 +7390,44 @@ fn replace_realtime_dictation_text(previous: String, text: String) -> Result<(),
 
 #[tauri::command]
 fn clear_dictation_focus_target() {
+    DICTATION_ACTIVE.store(false, Ordering::SeqCst);
     dictation::clear_focus_target();
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkArea {
+    x: i32,
+    y: i32,
+    width: i32,
+    height: i32,
+}
+
+/// 主显示器工作区（去掉任务栏），用于把听写胶囊定位到屏幕底部居中。
+#[cfg(windows)]
+#[tauri::command]
+fn get_work_area() -> Result<WorkArea, String> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SystemParametersInfoW, SPI_GETWORKAREA};
+    unsafe {
+        let mut rect = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let ok = SystemParametersInfoW(SPI_GETWORKAREA, 0, &mut rect as *mut RECT as *mut core::ffi::c_void, 0);
+        if ok == 0 {
+            return Err("无法获取屏幕工作区".to_string());
+        }
+        Ok(WorkArea {
+            x: rect.left,
+            y: rect.top,
+            width: rect.right - rect.left,
+            height: rect.bottom - rect.top,
+        })
+    }
+}
+
+#[cfg(not(windows))]
+#[tauri::command]
+fn get_work_area() -> Result<WorkArea, String> {
+    Err("仅支持 Windows".to_string())
 }
 
 #[cfg(windows)]
@@ -6903,13 +7610,7 @@ fn inject_pointer_double_click() -> Result<(), String> {
     };
     let send = |flags| {
         let input = mouse_input(flags);
-        let sent = unsafe {
-            SendInput(
-                1,
-                &input,
-                std::mem::size_of::<INPUT>() as i32,
-            )
-        };
+        let sent = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
         (sent == 1)
             .then_some(())
             .ok_or_else(|| "Windows 未能注入完整的双击事件。".to_string())
@@ -7173,9 +7874,10 @@ async fn computer_execute_action(
     if COMPUTER_CONTROL_STOPPED.load(Ordering::SeqCst) {
         return Err("电脑操控已停止。".to_string());
     }
-    if action.observation_sequence.is_some_and(|sequence| {
-        sequence != COMPUTER_MARK_SEQUENCE.load(Ordering::SeqCst)
-    }) {
+    if action
+        .observation_sequence
+        .is_some_and(|sequence| sequence != COMPUTER_MARK_SEQUENCE.load(Ordering::SeqCst))
+    {
         trace_computer_control(&format!(
             "stale action rejected observation_sequence={:?} current_sequence={}",
             action.observation_sequence,
@@ -7194,7 +7896,10 @@ async fn computer_execute_action(
         return Err("此操作需要用户确认。".to_string());
     }
     #[cfg(windows)]
-    if matches!(action.action.as_str(), "activate_window" | "maximize_window") {
+    if matches!(
+        action.action.as_str(),
+        "activate_window" | "maximize_window"
+    ) {
         let target = action
             .window_target
             .as_deref()
@@ -7862,12 +8567,13 @@ fn set_main_size(
     height: f64,
     restore_x: Option<i32>,
     restore_y: Option<i32>,
+    animate: Option<bool>,
 ) -> Result<(), String> {
     let main = app
         .get_webview_window("main")
         .ok_or_else(|| "主窗口尚未就绪".to_string())?;
-    let width = width.clamp(340.0, 560.0);
-    let height = height.clamp(72.0, 800.0);
+    let width = width.clamp(160.0, 760.0);
+    let height = height.clamp(48.0, 800.0);
     let scale = main.scale_factor().map_err(|error| error.to_string())?;
     let current = main.outer_size().map_err(|error| error.to_string())?;
     let anchor = main.outer_position().map_err(|error| error.to_string())?;
@@ -7877,6 +8583,15 @@ fn set_main_size(
     };
     let target_width = (width * scale).round() as u32;
     let target_height = (height * scale).round() as u32;
+    // 听写条出现/收起不做形变动画：作废在跑的动画线程后直接切换尺寸和位置。
+    if animate == Some(false) {
+        SIZE_ANIMATION_ID.fetch_add(1, Ordering::SeqCst);
+        main.set_size(PhysicalSize::new(target_width, target_height))
+            .map_err(|error| error.to_string())?;
+        main.set_position(destination)
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
     let animation_id = SIZE_ANIMATION_ID.fetch_add(1, Ordering::SeqCst) + 1;
     if current.width == target_width && current.height == target_height {
         main.set_position(destination)
@@ -8015,7 +8730,11 @@ fn move_main_by(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     STARTED_BY_AUTOSTART.store(
-        std::env::args_os().any(|argument| argument.to_string_lossy().eq_ignore_ascii_case("--autostart")),
+        std::env::args_os().any(|argument| {
+            argument
+                .to_string_lossy()
+                .eq_ignore_ascii_case("--autostart")
+        }),
         Ordering::SeqCst,
     );
     EXIT_REQUESTED.store(false, Ordering::SeqCst);
@@ -8107,10 +8826,8 @@ pub fn run() {
             // Force the edge layer into its idle state before the main window is shown.
             if let Some(edge) = app.get_webview_window("edge") {
                 edge.set_ignore_cursor_events(true)?;
-                EDGE_CAPTURE_EXCLUDED.store(
-                    exclude_edge_from_screen_capture(&edge),
-                    Ordering::SeqCst,
-                );
+                EDGE_CAPTURE_EXCLUDED
+                    .store(exclude_edge_from_screen_capture(&edge), Ordering::SeqCst);
                 edge.hide()?;
             }
             #[cfg(windows)]
@@ -8174,6 +8891,7 @@ pub fn run() {
             insert_text_to_active,
             replace_realtime_dictation_text,
             clear_dictation_focus_target,
+            get_work_area,
             is_alt_key_down,
             activate_assistant,
             hide_edge,

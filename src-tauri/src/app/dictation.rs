@@ -3,8 +3,8 @@ use serde_json::{json, Value};
 use std::sync::{Mutex, OnceLock};
 
 use super::{
-    api_error, endpoint, resolve_chat_provider, shared_http_client, ChatMessage, ChatRequest,
-    StoredProvider,
+    api_error, endpoint, resolve_chat_provider, shared_http_client, trace_runtime, ChatMessage,
+    ChatRequest, StoredProvider,
 };
 
 #[cfg(windows)]
@@ -12,26 +12,30 @@ use super::{
 struct FocusTarget {
     foreground: isize,
     focus: isize,
+    process_id: u32,
+    cursor_x: i32,
+    cursor_y: i32,
 }
 
 #[cfg(windows)]
 static FOCUS_TARGET: OnceLock<Mutex<Option<FocusTarget>>> = OnceLock::new();
 
 #[cfg(windows)]
-pub(crate) fn capture_focus_target() {
+pub(crate) fn capture_focus_target() -> bool {
+    use windows_sys::Win32::Foundation::POINT;
     use windows_sys::Win32::System::Threading::{
         AttachThreadInput, GetCurrentProcessId, GetCurrentThreadId,
     };
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetForegroundWindow, GetWindowThreadProcessId,
+        GetCursorPos, GetForegroundWindow, GetWindowThreadProcessId,
     };
 
     unsafe {
         let foreground = GetForegroundWindow();
         if foreground.is_null() {
             clear_focus_target();
-            return;
+            return false;
         }
         let mut process_id = 0;
         let target_thread = GetWindowThreadProcessId(foreground, &mut process_id);
@@ -40,8 +44,10 @@ pub(crate) fn capture_focus_target() {
         // composer and could submit the transcription as a chat message.
         if target_thread == 0 || process_id == GetCurrentProcessId() {
             clear_focus_target();
-            return;
+            return false;
         }
+        let mut cursor = POINT { x: 0, y: 0 };
+        let _ = GetCursorPos(&mut cursor);
         let current_thread = GetCurrentThreadId();
         let attached = current_thread != target_thread
             && target_thread != 0
@@ -56,7 +62,15 @@ pub(crate) fn capture_focus_target() {
             .unwrap() = Some(FocusTarget {
             foreground: foreground as isize,
             focus: focus as isize,
+            process_id,
+            cursor_x: cursor.x,
+            cursor_y: cursor.y,
         });
+        trace_runtime(&format!(
+            "dictation target captured process_id={process_id} foreground={:?} focus={:?} cursor=({}, {})",
+            foreground, focus, cursor.x, cursor.y
+        ));
+        true
     }
 }
 
@@ -69,6 +83,175 @@ pub(crate) fn clear_focus_target() {
 
 #[cfg(not(windows))]
 pub(crate) fn clear_focus_target() {}
+
+#[cfg(windows)]
+fn is_input_control_type(control_type: uiautomation::types::ControlType) -> bool {
+    use uiautomation::types::ControlType;
+
+    matches!(
+        control_type,
+        ControlType::Edit | ControlType::Document | ControlType::ComboBox | ControlType::Custom
+    )
+}
+
+#[cfg(windows)]
+fn focus_pointed_input(target: FocusTarget) -> bool {
+    use uiautomation::{types::Point, UIAutomation};
+
+    let Ok(automation) = UIAutomation::new() else {
+        return false;
+    };
+    let Ok(mut element) =
+        automation.element_from_point(Point::new(target.cursor_x, target.cursor_y))
+    else {
+        return false;
+    };
+    let Ok(walker) = automation.get_control_view_walker() else {
+        return false;
+    };
+    for _ in 0..7 {
+        let same_process = element
+            .get_process_id()
+            .is_ok_and(|process_id| process_id == target.process_id);
+        let input_like = element
+            .get_control_type()
+            .is_ok_and(is_input_control_type);
+        let focusable = element.is_keyboard_focusable().unwrap_or(false);
+        let enabled = element.is_enabled().unwrap_or(true);
+        if same_process && input_like && focusable && enabled && element.set_focus().is_ok() {
+            trace_runtime(&format!(
+                "dictation target restored through UI Automation process_id={} cursor=({}, {})",
+                target.process_id, target.cursor_x, target.cursor_y
+            ));
+            return true;
+        }
+        let Ok(parent) = walker.get_parent(&element) else {
+            break;
+        };
+        element = parent;
+    }
+    false
+}
+
+#[cfg(windows)]
+fn focus_nearby_input(target: FocusTarget) -> bool {
+    use uiautomation::{types::Handle, UIAutomation, UIElement};
+
+    let Ok(automation) = UIAutomation::new() else {
+        return false;
+    };
+    let Ok(root) = automation.element_from_handle(Handle::from(target.foreground)) else {
+        return false;
+    };
+    let Ok(walker) = automation.get_control_view_walker() else {
+        return false;
+    };
+    let mut nearest: Option<(i32, UIElement)> = None;
+    let mut stack = vec![(root, 0usize)];
+    while let Some((element, depth)) = stack.pop() {
+        if depth > 10 {
+            continue;
+        }
+        if let Ok(first) = walker.get_first_child(&element) {
+            let mut child = first;
+            loop {
+                stack.push((child.clone(), depth + 1));
+                match walker.get_next_sibling(&child) {
+                    Ok(next) => child = next,
+                    Err(_) => break,
+                }
+            }
+        }
+        let is_candidate = element
+            .get_process_id()
+            .is_ok_and(|process_id| process_id == target.process_id)
+            && element
+                .get_control_type()
+                .is_ok_and(is_input_control_type)
+            && element.is_keyboard_focusable().unwrap_or(false)
+            && element.is_enabled().unwrap_or(true)
+            && !element.is_offscreen().unwrap_or(true);
+        if !is_candidate {
+            continue;
+        }
+        let Ok(rect) = element.get_bounding_rectangle() else {
+            continue;
+        };
+        let left = rect.get_left();
+        let top = rect.get_top();
+        let right = left + rect.get_width();
+        let bottom = top + rect.get_height();
+        let dx = if target.cursor_x < left {
+            left - target.cursor_x
+        } else if target.cursor_x > right {
+            target.cursor_x - right
+        } else {
+            0
+        };
+        let dy = if target.cursor_y < top {
+            top - target.cursor_y
+        } else if target.cursor_y > bottom {
+            target.cursor_y - bottom
+        } else {
+            0
+        };
+        let distance_squared = dx.saturating_mul(dx) + dy.saturating_mul(dy);
+        if nearest
+            .as_ref()
+            .is_none_or(|(best_distance, _)| distance_squared < *best_distance)
+        {
+            nearest = Some((distance_squared, element));
+        }
+    }
+    let Some((distance_squared, element)) = nearest else {
+        return false;
+    };
+    // A nearby control is a fallback for composite web UIs, not a guess across
+    // the window. Forty-eight physical pixels keeps a toolbar/menu out of range.
+    if distance_squared > 48 * 48 || element.set_focus().is_err() {
+        return false;
+    }
+    trace_runtime(&format!(
+        "dictation target restored through nearby UI Automation input process_id={} distance_squared={distance_squared}",
+        target.process_id
+    ));
+    true
+}
+
+#[cfg(windows)]
+/// `Some(false)` is reserved for controls that are definitely not text inputs.
+/// Many Chromium surfaces expose their focused composer as a generic Pane, so
+/// those must remain unknown instead of being rejected.
+fn focused_element_is_input(target: FocusTarget) -> Option<bool> {
+    use uiautomation::{types::ControlType, UIAutomation};
+
+    let automation = UIAutomation::new().ok()?;
+    let element = automation.get_focused_element().ok()?;
+    let same_process = element
+        .get_process_id()
+        .ok()
+        .is_some_and(|process_id| process_id == target.process_id);
+    if !same_process || !element.is_enabled().unwrap_or(true) {
+        return Some(false);
+    }
+    match element.get_control_type().ok()? {
+        control_type if is_input_control_type(control_type) => Some(true),
+        ControlType::Button
+        | ControlType::CheckBox
+        | ControlType::Hyperlink
+        | ControlType::ListItem
+        | ControlType::Menu
+        | ControlType::MenuBar
+        | ControlType::MenuItem
+        | ControlType::RadioButton
+        | ControlType::Slider
+        | ControlType::Spinner
+        | ControlType::TabItem
+        | ControlType::TreeItem
+        | ControlType::SplitButton => Some(false),
+        _ => None,
+    }
+}
 
 fn is_dictation_punctuation(character: char) -> bool {
     matches!(
@@ -89,42 +272,22 @@ fn is_dictation_punctuation(character: char) -> bool {
     )
 }
 
-fn is_cjk_text(character: char) -> bool {
-    matches!(
-        character,
-        '\u{3400}'..='\u{4dbf}'
-            | '\u{4e00}'..='\u{9fff}'
-            | '\u{f900}'..='\u{faff}'
-            | '\u{3040}'..='\u{30ff}'
-            | '\u{ac00}'..='\u{d7af}'
-    )
-}
-
-fn normalize_dictation_punctuation(value: &str) -> String {
+/// 听写文本统一使用英文半角标点：ASR 和润色模型偶尔输出全角标点，写入前强制归一。
+pub(crate) fn normalize_dictation_punctuation(value: &str) -> String {
     let characters = value.chars().collect::<Vec<_>>();
     let mut output = String::with_capacity(value.len());
-    for (index, character) in characters.iter().copied().enumerate() {
-        let previous = characters[..index]
-            .iter()
-            .rev()
-            .copied()
-            .find(|character| !character.is_whitespace());
-        let next = characters[index + 1..]
-            .iter()
-            .copied()
-            .find(|character| !character.is_whitespace());
-        let cjk_context = previous.is_some_and(is_cjk_text) || next.is_some_and(is_cjk_text);
+    for character in characters.iter().copied() {
         let normalized = match character {
-            ',' if cjk_context => '，',
-            '?' if cjk_context => '？',
-            '!' if cjk_context => '！',
-            ';' if cjk_context => '；',
-            ':' if cjk_context => '：',
-            '.' if previous.is_some_and(is_cjk_text)
-                && next.is_none_or(|character| !character.is_ascii_alphanumeric()) =>
-            {
-                '。'
-            }
+            '，' | '、' => ',',
+            '。' => '.',
+            '？' => '?',
+            '！' => '!',
+            '；' => ';',
+            '：' => ':',
+            '（' => '(',
+            '）' => ')',
+            '“' | '”' => '"',
+            '\u{2018}' | '\u{2019}' => '\'',
             _ => character,
         };
         if is_dictation_punctuation(normalized) {
@@ -133,6 +296,10 @@ fn normalize_dictation_punctuation(value: &str) -> String {
             }
         }
         output.push(normalized);
+    }
+    // 正常打字不会特意在末尾敲句号：剥掉结尾的句点（连同尾随空格，连续句点一并去掉）。
+    while matches!(output.chars().last(), Some('.') | Some('。') | Some(' ')) {
+        output.pop();
     }
     output
 }
@@ -373,16 +540,15 @@ fn preserves_semantic_markers(source: &str, candidate: &str) -> bool {
 
 fn negated_action_signature(value: &str) -> Vec<(String, bool)> {
     const ACTIONS: &[&str] = &[
-        "打开", "关闭", "发送", "删除", "保存", "取消", "停止", "允许", "禁止", "增加",
-        "减少", "上传", "下载", "付款", "转账",
+        "打开", "关闭", "发送", "删除", "保存", "取消", "停止", "允许", "禁止", "增加", "减少",
+        "上传", "下载", "付款", "转账",
     ];
     const NEGATIONS: &[&str] = &["不", "别", "没", "无", "勿", "禁止"];
     let characters = value.char_indices().collect::<Vec<_>>();
     let mut actions = Vec::new();
     for action in ACTIONS {
         for (byte_index, _) in value.match_indices(action) {
-            let character_index = characters
-                .partition_point(|(offset, _)| *offset < byte_index);
+            let character_index = characters.partition_point(|(offset, _)| *offset < byte_index);
             let lookbehind_start = character_index.saturating_sub(5);
             let lookbehind_byte = characters
                 .get(lookbehind_start)
@@ -631,7 +797,9 @@ async fn complete_dictation(
     max_tokens: usize,
 ) -> Result<String, String> {
     match provider.kind.as_str() {
-        "anthropic" => complete_dictation_anthropic(client, provider, key, messages, max_tokens).await,
+        "anthropic" => {
+            complete_dictation_anthropic(client, provider, key, messages, max_tokens).await
+        }
         "google" => complete_dictation_google(client, provider, key, messages, max_tokens).await,
         _ => complete_dictation_openai(client, provider, key, messages, max_tokens).await,
     }
@@ -710,12 +878,13 @@ pub async fn optimize_dictation(
          {vocabulary_rule}\n\
          {memory_rule}\n\
          标点恢复是必须完成的核心任务：先理解整段话，再按语义关系断句。并列、转折、因果、条件、补充说明和话题切换处应使用合适的逗号、分号、冒号、问号或感叹号；不要把多个完整分句连成一整串，也不要机械地按停顿乱加标点。\n\
+         所有标点一律使用英文半角符号：逗号用 , 句号用 . 问号用 ? 感叹号用 ! 分号用 ; 冒号用 : 引号用 \" 和 ' 括号用 ( )；顿号也写成半角逗号。严禁输出全角标点（，。？！、；：“”‘’（））。\n\
          删除无意义的‘嗯’‘啊’‘呃’‘那个’‘就是说’以及口吃和自我重复。仅在当前整理强度允许时改字、补词或调整语序；宁可保留略显口语的表达，也不能猜测用户没说过的内容。正确处理英文大小写和常见产品名。\n\
          数字、日期、数量、人名、地点、软件或文件名称、否定范围、可能性、时间先后、操作对象与方向、网址、文件路径和用户命令不可擅自改变。不得补充事实、替换对象、回答内容、总结或续写。\n\
          默认不要在整段末尾添加句号；明确的疑问句和感叹句应保留问号或感叹号。\n\
-         示例一：‘嗯那个你帮我看一下这个为什么打不开然后修一下但是不要改我的设置’应整理为‘你帮我看一下这个为什么打不开，然后修一下，但不要改我的设置’。\n\
-         示例二：‘我刚才说的是打开微信不是关闭微信你明白吗’应整理为‘我刚才说的是打开微信，不是关闭微信，你明白吗？’。\n\
-         示例三：‘这个功能我试了好几次就是就是有时候可以有时候不行你仔细排查一下’应整理为‘这个功能我试了好几次，有时候可以，有时候不行，你仔细排查一下’。\n\
+         示例一：‘嗯那个你帮我看一下这个为什么打不开然后修一下但是不要改我的设置’应整理为‘你帮我看一下这个为什么打不开, 然后修一下, 但不要改我的设置’。\n\
+         示例二：‘我刚才说的是打开微信不是关闭微信你明白吗’应整理为‘我刚才说的是打开微信, 不是关闭微信, 你明白吗?’。\n\
+         示例三：‘这个功能我试了好几次就是就是有时候可以有时候不行你仔细排查一下’应整理为‘这个功能我试了好几次, 有时候可以, 有时候不行, 你仔细排查一下’。\n\
          输出前在内部自行终审一次：检查是否遗漏语义边界的标点、是否把主谓宾或固定搭配错误拆开、疑问句是否用了问号。不要输出检查过程。"
     );
     let messages = vec![
@@ -827,7 +996,10 @@ mod tests {
             clean_dictation_layout("你看一下,这个为什么不行?真的很奇怪!"),
             "你看一下，这个为什么不行？真的很奇怪！"
         );
-        assert_eq!(clean_dictation_layout("Gemini 3.7 Flash"), "Gemini 3.7 Flash");
+        assert_eq!(
+            clean_dictation_layout("Gemini 3.7 Flash"),
+            "Gemini 3.7 Flash"
+        );
     }
 
     #[test]
@@ -878,28 +1050,57 @@ fn restore_focus_before_input() -> Result<(), String> {
         let current_thread = GetCurrentThreadId();
         let mut process_id = 0;
         let target_thread = GetWindowThreadProcessId(foreground, &mut process_id);
-        if target_thread == 0 || process_id == GetCurrentProcessId() {
+        if target_thread == 0
+            || process_id != target.process_id
+            || process_id == GetCurrentProcessId()
+        {
             clear_focus_target();
             return Err("原输入框不再可用，未向 Kero 胶囊写入听写内容。".to_string());
-        }
-        if focus.is_null() || IsWindow(focus) == 0 {
-            clear_focus_target();
-            return Err("没有可恢复的文本输入焦点，未写入听写内容。".to_string());
         }
         let attached = current_thread != target_thread
             && target_thread != 0
             && AttachThreadInput(current_thread, target_thread, 1) != 0;
-        let foreground_set = SetForegroundWindow(foreground) != 0;
+        let _ = SetForegroundWindow(foreground);
         SetActiveWindow(foreground);
-        SetFocus(focus);
-        let focus_set = GetFocus() == focus;
+        let native_focus_restored = !focus.is_null() && IsWindow(focus) != 0 && {
+            SetFocus(focus);
+            GetFocus() == focus
+        };
         if attached {
             AttachThreadInput(current_thread, target_thread, 0);
         }
-        std::thread::sleep(std::time::Duration::from_millis(35));
-        if !foreground_set || GetForegroundWindow() != foreground || !focus_set {
+        // Chromium/Electron hosts often expose a single native render HWND for
+        // the entire page. Re-focus the UI Automation element under the cursor
+        // even when that HWND was restored, so the actual composer wins over a
+        // menu bar or another web control in the same window.
+        let semantic_focus_restored = focus_pointed_input(target) || focus_nearby_input(target);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        let active = GetForegroundWindow();
+        let mut active_process_id = 0;
+        if !active.is_null() {
+            GetWindowThreadProcessId(active, &mut active_process_id);
+        }
+        if active_process_id != target.process_id || active_process_id == GetCurrentProcessId() {
+            trace_runtime(&format!(
+                "dictation target restore rejected expected_process_id={} active_process_id={} native_focus={} semantic_focus={}",
+                target.process_id, active_process_id, native_focus_restored, semantic_focus_restored
+            ));
             return Err("无法恢复原输入框焦点，未写入听写内容。".to_string());
         }
+        if matches!(focused_element_is_input(target), Some(false)) {
+            trace_runtime(&format!(
+                "dictation target restore rejected because the focused UI Automation element is not editable process_id={} native_focus={} semantic_focus={}",
+                target.process_id, native_focus_restored, semantic_focus_restored
+            ));
+            return Err(
+                "未能确认原输入框仍处于编辑状态，已取消写入以避免误触菜单或按钮。".to_string(),
+            );
+        }
+        trace_runtime(&format!(
+            "dictation target ready process_id={} native_focus={} semantic_focus={}",
+            target.process_id, native_focus_restored, semantic_focus_restored
+        ));
     }
     Ok(())
 }
@@ -907,8 +1108,7 @@ fn restore_focus_before_input() -> Result<(), String> {
 #[cfg(windows)]
 pub(crate) fn send_unicode_text(text: &str) -> Result<(), String> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE,
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     };
 
     let keyboard_input = |virtual_key, scan_code, flags| INPUT {
@@ -933,11 +1133,7 @@ pub(crate) fn send_unicode_text(text: &str) -> Result<(), String> {
             inputs.push(keyboard_input(0x0d, 0, KEYEVENTF_KEYUP));
         } else {
             inputs.push(keyboard_input(0, unit, KEYEVENTF_UNICODE));
-            inputs.push(keyboard_input(
-                0,
-                unit,
-                KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-            ));
+            inputs.push(keyboard_input(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP));
         }
     }
     for chunk in inputs.chunks(256) {
@@ -1022,7 +1218,7 @@ fn send_backspaces(count: usize) -> Result<(), String> {
 
 #[cfg(windows)]
 fn insert_text_to_active_impl(text: &str) -> Result<(), String> {
-    let result = restore_focus_before_input().and_then(|_| send_unicode_text(text));
+    let result = restore_focus_before_input().and_then(|_| send_unicode_text(&normalize_dictation_punctuation(text)));
     clear_focus_target();
     result
 }
@@ -1039,10 +1235,31 @@ pub fn insert_text_to_active(text: String) -> Result<(), String> {
 pub fn replace_realtime_dictation_text(previous: String, text: String) -> Result<(), String> {
     #[cfg(windows)]
     {
+        let text = normalize_dictation_punctuation(&text);
+        let previous = normalize_dictation_punctuation(&previous);
         restore_focus_before_input()?;
-        send_backspaces(previous.encode_utf16().count())?;
-        return send_unicode_text(&text);
+        // 只回退并重打有差异的后缀：流式结果大多是追加，避免每次整句删除重打。
+        let previous_units: Vec<u16> = previous.encode_utf16().collect();
+        let text_units: Vec<u16> = text.encode_utf16().collect();
+        let common = previous_units
+            .iter()
+            .zip(text_units.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        let remove_count = previous_units.len() - common;
+        if remove_count > 0 {
+            send_backspaces(remove_count)?;
+        }
+        let suffix = String::from_utf16(&text_units[common..])
+            .map_err(|_| "实时转写文本包含无效字符".to_string())?;
+        if suffix.is_empty() {
+            return Ok(());
+        }
+        return send_unicode_text(&suffix);
     }
     #[cfg(not(windows))]
-    Err("Dictation text input is only available on Windows".to_string())
+    {
+        let _ = (previous, text);
+        Err("Dictation text input is only available on Windows".to_string())
+    }
 }

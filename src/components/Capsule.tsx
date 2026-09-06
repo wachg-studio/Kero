@@ -2,7 +2,7 @@ import { emitTo, listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, AudioLines, BrainCircuit, Check, ChevronUp, Droplets, EyeOff, LockKeyhole, MessageCircleMore, Minimize2, MonitorUp, MousePointer2, Power, SendHorizontal, Settings2, SlidersHorizontal, Square, Waves, X } from "lucide-react";
+import { ArrowDown, ArrowLeft, ArrowRight, ArrowUp, AudioLines, BrainCircuit, Check, ChevronUp, Copy, Droplets, EyeOff, LockKeyhole, MessageCircleMore, Minimize2, MonitorUp, MousePointer2, Power, RotateCcw, SendHorizontal, Settings2, SlidersHorizontal, Square, Waves, X } from "lucide-react";
 import { CSSProperties, FormEvent, MouseEvent as ReactMouseEvent, PointerEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -31,13 +31,13 @@ type ListeningMode = "chat" | "dictation" | "realtime";
 
 type VoiceResources = {
   stream: MediaStream;
-  context: AudioContext;
+  context?: AudioContext;
   animationFrame: number;
 };
 
 type RealtimeDictationCapture = {
   context: AudioContext;
-  processor: ScriptProcessorNode;
+  processor: AudioWorkletNode;
   source: MediaStreamAudioSourceNode;
   silentGain: GainNode;
   sessionId: string;
@@ -48,9 +48,27 @@ type RealtimeDictationCapture = {
 type RealtimeDictationEvent = {
   sessionId: string;
   text?: string | null;
+  fullText?: string | null;
   done: boolean;
   error?: string | null;
 };
+
+type DictationPhase = "idle" | "listening" | "finishing" | "recognizing" | "polishing" | "inserting" | "error";
+
+// 千问式细长听写条：单行高度，文字从中间向两侧拉长，宽度封顶后内部横向滚动。
+const dictationPillHeight = 48;
+const dictationPillMinWidth = 168;
+const dictationPillMaxWidth = 720;
+// 中间实时声波的 22 根细条：静默时收敛成小点，说话时按麦克风能量拉成波形。
+const dictationWaveFactors = [0.4, 0.72, 0.5, 0.92, 0.62, 1, 0.7, 0.86, 0.52, 0.78, 0.96, 0.6, 0.82, 0.46, 0.9, 0.66, 1, 0.72, 0.56, 0.88, 0.5, 0.64];
+
+function estimateDictationTextWidth(text: string) {
+  let width = 0;
+  for (const char of text) {
+    width += /[\u2e80-\u9fff\uac00-\ud7af\uff00-\uffef\u3000-\u303f]/.test(char) ? 15 : 8;
+  }
+  return width;
+}
 
 type ContextMenuState = { x: number; above: boolean; origin?: WindowPosition } | null;
 type CapsuleSize = "compact" | "standard" | "wide";
@@ -60,6 +78,7 @@ type InlineMessage = Pick<ChatMessage, "id" | "role" | "content">;
 type StreamPayload = { requestId: string; delta?: string; done: boolean; error?: string };
 type ScreenTranslationStatus = { active: boolean; loading: boolean; error?: string | null };
 type WindowPosition = { x: number; y: number };
+type WorkArea = { x: number; y: number; width: number; height: number };
 type ContextMenuPlacement = { above: boolean; targetY?: number };
 type ComputerAction = {
   action: string;
@@ -149,8 +168,8 @@ const defaultAppearance: Appearance = {
   dictationCorrection: true,
   dictationMemory: true,
   dictationEdgeEnabled: true,
-  dictationMode: "native",
-  aiDictationPolish: false,
+  dictationMode: "ai",
+  aiDictationPolish: true,
   realtimeEdgeEnabled: true,
   clickThrough: false,
   positionLocked: false,
@@ -250,22 +269,63 @@ function dictationRecorderMimeType() {
   return candidates.find((mimeType) => MediaRecorder.isTypeSupported(mimeType)) ?? "";
 }
 
-function downsamplePcmTo16Bit(input: Float32Array, inputRate: number, outputRate: number) {
-  if (inputRate === outputRate) {
-    const output = new Int16Array(input.length);
-    for (let index = 0; index < input.length; index += 1) output[index] = Math.max(-1, Math.min(1, input[index])) * 0x7fff;
-    return output;
+function isStreamDictationModelName(model: string) {
+  const value = model.trim().toLowerCase();
+  return value.includes("realtime") || value.includes("streaming");
+}
+
+const KERO_PCM_WORKLET_SRC = `
+class KeroPcmCapture extends AudioWorkletProcessor {
+  constructor(options) {
+    super();
+    const outputRate = (options && options.processorOptions && options.processorOptions.outputRate) || 16000;
+    this.ratio = sampleRate / outputRate;
+    this.pending = [];
+    this.output = [];
+    this.target = Math.max(320, Math.floor(outputRate / 10));
   }
-  const ratio = inputRate / outputRate;
-  const output = new Int16Array(Math.floor(input.length / ratio));
-  for (let index = 0; index < output.length; index += 1) {
-    const start = Math.floor(index * ratio);
-    const end = Math.min(input.length, Math.floor((index + 1) * ratio));
-    let total = 0;
-    for (let cursor = start; cursor < Math.max(start + 1, end); cursor += 1) total += input[cursor] ?? 0;
-    output[index] = Math.max(-1, Math.min(1, total / Math.max(1, end - start))) * 0x7fff;
+  process(inputs) {
+    const input = inputs[0];
+    const channel = input && input[0];
+    if (channel && channel.length > 0) {
+      for (let index = 0; index < channel.length; index += 1) this.pending.push(channel[index]);
+      const ratio = this.ratio;
+      const outputCount = Math.floor(this.pending.length / ratio);
+      const consumed = Math.floor(outputCount * ratio);
+      for (let index = 0; index < outputCount; index += 1) {
+        const start = Math.floor(index * ratio);
+        const end = Math.min(this.pending.length, Math.floor((index + 1) * ratio));
+        let total = 0;
+        for (let cursor = start; cursor < Math.max(start + 1, end); cursor += 1) total += this.pending[cursor];
+        const value = Math.max(-1, Math.min(1, total / Math.max(1, end - start)));
+        this.output.push(value < 0 ? value * 0x8000 : value * 0x7fff);
+      }
+      if (consumed > 0) this.pending = this.pending.slice(consumed);
+      if (this.output.length >= this.target) {
+        const buffer = new Int16Array(this.output);
+        this.output = [];
+        this.port.postMessage(buffer.buffer, [buffer.buffer]);
+      }
+    }
+    return true;
   }
-  return output;
+}
+registerProcessor("kero-pcm-capture", KeroPcmCapture);
+`;
+
+async function createPcmWorkletNode(context: AudioContext, outputRate: number) {
+  const moduleUrl = URL.createObjectURL(new Blob([KERO_PCM_WORKLET_SRC], { type: "application/javascript" }));
+  try {
+    await context.audioWorklet.addModule(moduleUrl);
+  } finally {
+    URL.revokeObjectURL(moduleUrl);
+  }
+  return new AudioWorkletNode(context, "kero-pcm-capture", {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+    processorOptions: { outputRate },
+  });
 }
 
 function pcmToBase64(chunks: Int16Array[]) {
@@ -291,11 +351,11 @@ function normalizedAppearance(value: Partial<Appearance>): Appearance {
     glassEnabled: value.glassEnabled !== false,
     edgeEnabled: value.edgeEnabled !== false,
     autoSend: value.autoSend !== false,
-    dictationCorrection: value.dictationCorrection !== false,
-    dictationMemory: value.dictationMemory !== false,
-    dictationEdgeEnabled: value.dictationEdgeEnabled !== false,
-    dictationMode: value.dictationMode === "ai" ? "ai" : "native",
-    aiDictationPolish: value.aiDictationPolish === true,
+  dictationCorrection: value.dictationCorrection !== false,
+  dictationMemory: value.dictationMemory !== false,
+  dictationEdgeEnabled: value.dictationEdgeEnabled !== false,
+  dictationMode: value.dictationMode === "native" ? "native" : "ai",
+  aiDictationPolish: value.aiDictationPolish !== false,
     realtimeEdgeEnabled: value.realtimeEdgeEnabled !== false,
     clickThrough: value.clickThrough === true,
     positionLocked: value.positionLocked === true,
@@ -373,6 +433,9 @@ export function Capsule() {
   const [voiceEnergy, setVoiceEnergy] = useState(0);
   const [isDictating, setIsDictating] = useState(false);
   const [dictationStatus, setDictationStatus] = useState("");
+  const [dictationPhase, setDictationPhase] = useState<DictationPhase>("idle");
+  const [dictationTranscript, setDictationTranscript] = useState("");
+  const [dictationError, setDictationError] = useState("");
   const [realtimeActive, setRealtimeActive] = useState(false);
   const [realtimePermissionOpen, setRealtimePermissionOpen] = useState(false);
   const [contextMenu, setContextMenu] = useState<ContextMenuState>(null);
@@ -396,7 +459,6 @@ export function Capsule() {
   const dictationOpenedFromTray = useRef(false);
   const dictationSessionId = useRef(0);
   const trayDictationSessionId = useRef<number | null>(null);
-  const altKeyPoll = useRef<number | null>(null);
   const dictationStopTimer = useRef<number | null>(null);
   const dictationLastResultAt = useRef(0);
   const dictationRecorder = useRef<MediaRecorder | null>(null);
@@ -407,7 +469,16 @@ export function Capsule() {
   const realtimeDictationWritten = useRef("");
   const realtimeDictationInputFailed = useRef(false);
   const realtimeDictationInsertQueue = useRef(Promise.resolve());
+  const realtimeReplaceTimer = useRef<number | null>(null);
+  const realtimePendingWritten = useRef("");
   const dictationStopRequested = useRef(false);
+  const dictationFlowId = useRef(0);
+  const dictationFinalTextRef = useRef("");
+  const dictationTranscriptRef = useRef<HTMLDivElement | null>(null);
+  const realtimeFallbackRecorder = useRef<MediaRecorder | null>(null);
+  const realtimeFallbackChunks = useRef<Blob[]>([]);
+  const dictationGrowOrigin = useRef<WindowPosition | null>(null);
+  const dictationStartedHidden = useRef(false);
   const stopListeningRef = useRef<((submit?: boolean) => void) | null>(null);
   const startListeningRef = useRef<((mode?: ListeningMode) => Promise<void>) | null>(null);
   const recognition = useRef<SpeechRecognitionLike | null>(null);
@@ -459,6 +530,16 @@ export function Capsule() {
   const menuOpen = contextMenu !== null;
   const dictationProcessing = Boolean(dictationStatus);
   const currentWidth = sizeWidths[appearance.size];
+  const dictationPanel = isDictating || dictationPhase !== "idle";
+  // 文字从中间向两侧拉长；到达宽度上限后窗口不再变宽，转写区内部横向滚动。
+  const dictationWidth = !dictationPanel
+    ? currentWidth
+    : dictationPhase === "error"
+      ? Math.min(dictationPillMaxWidth, 480)
+      : Math.min(
+          dictationPillMaxWidth,
+          Math.max(dictationPillMinWidth, 104 + (dictationTranscript ? estimateDictationTextWidth(dictationTranscript) : 0)),
+        );
   const recentMessages = useMemo(() => messages.slice(-2), [messages]);
   const inlineReplyLength = useMemo(() => Math.max(
     mcpDecision ? mcpDecision.summary.length + (mcpDecision.detail?.length ?? 0) + (mcpDecision.nextAction?.length ?? 0) : 0,
@@ -506,6 +587,16 @@ export function Capsule() {
       dictationRecorder.current = null;
       dictationAudioChunks.current = [];
     }
+    const fallbackRecorder = realtimeFallbackRecorder.current;
+    if (fallbackRecorder) {
+      fallbackRecorder.ondataavailable = null;
+      fallbackRecorder.onstop = null;
+      if (fallbackRecorder.state !== "inactive") {
+        try { fallbackRecorder.stop(); } catch { /* Recorder is already closing. */ }
+      }
+      realtimeFallbackRecorder.current = null;
+      realtimeFallbackChunks.current = [];
+    }
     const realtimeCapture = realtimeDictationCapture.current;
     if (realtimeCapture) {
       realtimeCapture.processor.disconnect();
@@ -518,7 +609,7 @@ export function Capsule() {
     if (resources) {
       cancelAnimationFrame(resources.animationFrame);
       resources.stream.getTracks().forEach((track) => track.stop());
-      void resources.context.close();
+      void resources.context?.close();
       voiceResources.current = null;
     }
     if (recognition.current) {
@@ -528,6 +619,118 @@ export function Capsule() {
     }
     setVoiceEnergy(0);
   }, []);
+
+  // 取出并停掉流式会话并行录制的兜底音频；成功路径丢弃，失败路径用于整段识别降级。
+  const takeRealtimeFallbackBlob = useCallback(() => {
+    const recorder = realtimeFallbackRecorder.current;
+    realtimeFallbackRecorder.current = null;
+    if (!recorder) return null;
+    const chunks = realtimeFallbackChunks.current;
+    realtimeFallbackChunks.current = [];
+    recorder.ondataavailable = null;
+    recorder.onstop = null;
+    if (recorder.state !== "inactive") {
+      try { recorder.stop(); } catch { /* Recorder is already closing. */ }
+    }
+    if (!chunks.length) return null;
+    return new Blob(chunks, { type: recorder.mimeType || dictationRecorderMimeType() });
+  }, []);
+
+  // 把最新流式文本打入目标输入框；Rust 侧做差量替换（只回退重打有差异的尾巴）。
+  const applyRealtimeReplace = useCallback(() => {
+    const incoming = realtimePendingWritten.current;
+    if (!incoming || dictationStopRequested.current || incoming === realtimeDictationWritten.current) return;
+    const previousWritten = realtimeDictationWritten.current;
+    realtimeDictationWritten.current = incoming;
+    realtimeDictationInsertQueue.current = realtimeDictationInsertQueue.current
+      .then(() => invoke("replace_realtime_dictation_text", { previous: previousWritten, text: incoming }).then(() => undefined))
+      .catch(() => {
+        realtimeDictationWritten.current = previousWritten;
+        realtimeDictationInputFailed.current = true;
+      });
+  }, []);
+
+  const clearRealtimeReplaceTimer = useCallback(() => {
+    if (realtimeReplaceTimer.current !== null) {
+      window.clearTimeout(realtimeReplaceTimer.current);
+      realtimeReplaceTimer.current = null;
+    }
+  }, []);
+
+  const closeDictationPanel = useCallback(() => {
+    takeRealtimeFallbackBlob();
+    setDictationPhase("idle");
+    setDictationTranscript("");
+    setDictationError("");
+    dictationFinalTextRef.current = "";
+    realtimeDictationInputFailed.current = false;
+    void invoke("clear_dictation_focus_target");
+    hideAfterTrayDictation();
+  }, [hideAfterTrayDictation, takeRealtimeFallbackBlob]);
+
+  const cancelDictation = useCallback(() => {
+    dictationFlowId.current += 1;
+    dictationHeldRef.current = false;
+    const span = realtimeDictationWritten.current;
+    realtimeDictationWritten.current = "";
+    const sessionId = realtimeDictationSessionId.current;
+    realtimeDictationSessionId.current = null;
+    realtimeDictationInsertQueue.current = realtimeDictationInsertQueue.current.then(async () => {
+      if (span) {
+        // 已经实时打入目标输入框的文字随取消一起清掉。
+        await invoke("replace_realtime_dictation_text", { previous: span, text: "" }).catch(() => undefined);
+      }
+    });
+    clearRealtimeReplaceTimer();
+    releaseVoice();
+    if (sessionId) void invoke("finish_realtime_dictation", { sessionId }).catch(() => undefined);
+    listeningRef.current = false;
+    listeningMode.current = "chat";
+    setListening(false);
+    setIsDictating(false);
+    closeDictationPanel();
+  }, [clearRealtimeReplaceTimer, closeDictationPanel, releaseVoice]);
+
+  const retryDictationInsert = useCallback(() => {
+    const text = dictationFinalTextRef.current.trim();
+    if (!text) {
+      closeDictationPanel();
+      return;
+    }
+    const span = realtimeDictationWritten.current;
+    setDictationPhase("inserting");
+    realtimeDictationInsertQueue.current = realtimeDictationInsertQueue.current.then(async () => {
+      try {
+        if (span) {
+          await invoke("replace_realtime_dictation_text", { previous: span, text });
+        } else {
+          await invoke("insert_text_to_active", { text });
+        }
+        realtimeDictationWritten.current = "";
+        closeDictationPanel();
+      } catch (error) {
+        setDictationError(error instanceof Error ? error.message : "无法写入原输入框，请重试或复制内容");
+        setDictationPhase("error");
+      }
+    });
+  }, [closeDictationPanel]);
+
+  const copyDictationText = useCallback(async () => {
+    const text = dictationFinalTextRef.current.trim() || dictationTranscript.trim();
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      closeDictationPanel();
+    } catch {
+      setDictationError("复制失败，请重试");
+      setDictationPhase("error");
+    }
+  }, [closeDictationPanel, dictationTranscript]);
+
+  useEffect(() => {
+    const node = dictationTranscriptRef.current;
+    if (node) node.scrollLeft = node.scrollWidth;
+  }, [dictationTranscript, dictationPhase]);
 
   const closeContextMenu = useCallback(() => {
     if (contextMenu?.above && contextMenu.origin) {
@@ -893,47 +1096,53 @@ export function Capsule() {
   }, [beginEdge, closeContextMenu, endEdge, handleScreenTranslationCommand, isStreaming, messages, releaseVoice, runComputerTask]);
 
   const finishDictation = useCallback(async (text: string, useTextOptimization = true) => {
-    setDictationStatus(useTextOptimization ? "正在由 AI 理解并整理" : "正在写入识别结果");
-    const vocabulary = readDictationVocabulary().join("\n");
-    const optimized = useTextOptimization
-      ? await invoke<string>("optimize_dictation", {
-          text,
-          correctTypos: appearance.dictationCorrection,
-          vocabulary,
-          memory: appearance.dictationMemory ? readDictationMemory().join("\n") : undefined,
-        }).catch(() => text)
-      : text.trim();
+    const flowId = dictationFlowId.current;
+    const raw = text.trim();
+    if (!raw) {
+      closeDictationPanel();
+      return;
+    }
+    let optimized = raw;
+    if (useTextOptimization) {
+      setDictationPhase("polishing");
+      const response = await invoke<string>("optimize_dictation", {
+        text: raw,
+        correctTypos: appearance.dictationCorrection,
+        vocabulary: readDictationVocabulary().join("\n"),
+        memory: appearance.dictationMemory ? readDictationMemory().join("\n") : undefined,
+      }).catch(() => raw);
+      if (dictationFlowId.current !== flowId) return;
+      optimized = response.trim() || raw;
+    }
+    dictationFinalTextRef.current = optimized;
     if (appearance.dictationMemory) rememberDictation(optimized);
-    let pasted = false;
+    setDictationPhase("inserting");
     try {
       await invoke("insert_text_to_active", { text: optimized });
-      pasted = true;
-      setDraft("");
+      if (dictationFlowId.current !== flowId) return;
+      closeDictationPanel();
     } catch (error) {
-      setDraft(optimized);
-      setDictationStatus(error instanceof Error
-        ? `${error.message} 识别内容已保留在胶囊中。`
-        : "无法写入原输入框，识别内容已保留在胶囊中。");
-    } finally {
-      if (pasted) setDictationStatus("");
-      if (appearance.dictationEdgeEnabled) endEdge();
-      if (pasted) hideAfterTrayDictation();
+      if (dictationFlowId.current !== flowId) return;
+      setDictationError(error instanceof Error ? error.message : "无法写入原输入框，可重试或复制内容");
+      setDictationPhase("error");
     }
-  }, [appearance.dictationCorrection, appearance.dictationEdgeEnabled, appearance.dictationMemory, endEdge, hideAfterTrayDictation]);
+  }, [appearance.dictationCorrection, appearance.dictationMemory, closeDictationPanel]);
 
   const finishAiDictation = useCallback(async (blob: Blob) => {
-    setDictationStatus("AI 语音识别中");
+    const flowId = dictationFlowId.current;
+    setDictationPhase("recognizing");
     try {
       const audioBase64 = await blobToBase64(blob);
       const text = await invoke<string>("transcribe_dictation_audio", {
         audioBase64,
         mimeType: blob.type || "audio/webm",
       });
+      if (dictationFlowId.current !== flowId) return;
       const transcript = text.trim();
       if (!transcript) throw new Error("AI 语音识别没有听到有效内容");
       transcriptRef.current = transcript;
       finalTranscriptRef.current = transcript;
-      setDraft(transcript);
+      setDictationTranscript(transcript);
       releaseVoice();
       listeningRef.current = false;
       listeningMode.current = "chat";
@@ -941,20 +1150,20 @@ export function Capsule() {
       setIsDictating(false);
       await finishDictation(transcript, appearance.aiDictationPolish);
     } catch (error) {
+      if (dictationFlowId.current !== flowId) return;
       void invoke("clear_dictation_focus_target");
       releaseVoice();
       listeningRef.current = false;
       listeningMode.current = "chat";
       setListening(false);
       setIsDictating(false);
-      setDictationStatus(error instanceof Error ? error.message : "AI 语音识别失败");
-      if (appearance.dictationEdgeEnabled) endEdge();
-      hideAfterTrayDictation();
+      setDictationError(error instanceof Error ? error.message : "AI 语音识别失败");
+      setDictationPhase("error");
     }
-  }, [appearance.aiDictationPolish, appearance.dictationEdgeEnabled, endEdge, finishDictation, hideAfterTrayDictation, releaseVoice]);
+  }, [appearance.aiDictationPolish, finishDictation, releaseVoice]);
 
   const finishRealtimeAiDictation = useCallback(async (sessionId: string) => {
-    setDictationStatus("正在收尾识别");
+    setDictationPhase("finishing");
     try {
       await invoke("finish_realtime_dictation", { sessionId });
     } catch (error) {
@@ -963,10 +1172,10 @@ export function Capsule() {
       listeningMode.current = "chat";
       setListening(false);
       setIsDictating(false);
-      setDictationStatus(error instanceof Error ? error.message : "AI 实时语音识别失败");
-      if (appearance.dictationEdgeEnabled) endEdge();
+      setDictationError(error instanceof Error ? error.message : "AI 实时语音识别失败");
+      setDictationPhase("error");
     }
-  }, [appearance.dictationEdgeEnabled, endEdge, releaseVoice]);
+  }, [releaseVoice]);
 
   const captureScreenImage = useCallback(() => invoke<string>("capture_primary_screen"), []);
 
@@ -1035,10 +1244,6 @@ export function Capsule() {
   }, [appearance.realtimeEdgeEnabled, beginEdge, captureScreenImage, handleScreenTranslationCommand, messages, runComputerTask]);
 
   const stopListening = useCallback((submit = true) => {
-    if (altKeyPoll.current !== null) {
-      window.clearInterval(altKeyPoll.current);
-      altKeyPoll.current = null;
-    }
     if (dictationStopTimer.current !== null) {
       window.clearTimeout(dictationStopTimer.current);
       dictationStopTimer.current = null;
@@ -1057,10 +1262,7 @@ export function Capsule() {
       return;
     }
     if (mode === "dictation") {
-      void invoke("clear_dictation_focus_target");
-      setDictationStatus("");
-      endEdge();
-      hideAfterTrayDictation();
+      closeDictationPanel();
       return;
     }
     if (mode === "realtime") {
@@ -1076,7 +1278,7 @@ export function Capsule() {
       return;
     }
     endEdge();
-  }, [appearance.realtimeEdgeEnabled, endEdge, finishDictation, hideAfterTrayDictation, releaseVoice, sendPrompt, sendRealtimePrompt]);
+  }, [appearance.realtimeEdgeEnabled, closeDictationPanel, endEdge, finishDictation, releaseVoice, sendPrompt, sendRealtimePrompt]);
 
   stopListeningRef.current = stopListening;
 
@@ -1088,11 +1290,8 @@ export function Capsule() {
     if (dictationStopRequested.current) return;
     dictationStopRequested.current = true;
     dictationHeldRef.current = false;
-    if (altKeyPoll.current !== null) {
-      window.clearInterval(altKeyPoll.current);
-      altKeyPoll.current = null;
-    }
-    setDictationStatus("正在收尾识别");
+    clearRealtimeReplaceTimer();
+    setDictationPhase("finishing");
     const recorder = dictationRecorder.current;
     const realtimeCapture = realtimeDictationCapture.current;
     if (realtimeCapture) {
@@ -1101,12 +1300,10 @@ export function Capsule() {
       realtimeCapture.source.disconnect();
       realtimeCapture.silentGain.disconnect();
       void realtimeCapture.context.close();
-      setDictationStatus("正在收尾识别");
       void realtimeCapture.sendQueue.finally(() => finishRealtimeAiDictation(realtimeCapture.sessionId));
       return;
     }
     if (recorder && recorder.state !== "inactive") {
-      setDictationStatus("正在提交 AI 语音识别");
       try {
         recorder.stop();
       } catch {
@@ -1126,33 +1323,44 @@ export function Capsule() {
       stopListeningRef.current?.(true);
       return;
     }
-  }, [finishRealtimeAiDictation]);
+  }, [clearRealtimeReplaceTimer, finishRealtimeAiDictation]);
+
+  // 千问式 ✓：聆听中点击等于松开 Alt（收尾→润色→写入）；出错时点击重试写入。
+  const confirmDictation = useCallback(() => {
+    if (dictationPhase === "error") {
+      retryDictationInsert();
+      return;
+    }
+    if (listeningRef.current && listeningMode.current === "dictation") {
+      requestDictationStop();
+    }
+  }, [dictationPhase, requestDictationStop, retryDictationInsert]);
 
   const startListening = useCallback(async (mode: ListeningMode = "chat") => {
     if (isStreamingRef.current || listeningRef.current) return;
+    dictationFlowId.current += 1;
+    const flowId = dictationFlowId.current;
     transcriptRef.current = "";
     finalTranscriptRef.current = "";
     dictationStopRequested.current = false;
     setListening(true);
     setIsDictating(mode === "dictation");
     setDictationStatus("");
+    setDictationTranscript("");
+    setDictationError("");
+    if (mode === "dictation") setDictationPhase("listening");
     listeningRef.current = true;
     listeningMode.current = mode;
+    if (mode === "dictation") dictationStartedHidden.current = false;
     closeContextMenu();
     if (mode === "dictation") {
       void invoke("warm_dictation_service").catch(() => undefined);
-      if (altKeyPoll.current !== null) window.clearInterval(altKeyPoll.current);
-      altKeyPoll.current = window.setInterval(() => {
-        void invoke<boolean>("is_alt_key_down").then((held) => {
-          if (!held && listeningRef.current && listeningMode.current === "dictation") {
-            requestDictationStop();
-          }
-        }).catch(() => undefined);
-      }, 90);
     }
-    const shouldShowEdge = mode === "dictation" ? appearance.dictationEdgeEnabled : mode === "realtime" ? appearance.realtimeEdgeEnabled : appearance.edgeEnabled;
+    // 听写不再点亮屏幕边缘光：只显示独立的听写胶囊。
+    const shouldShowEdge = mode === "realtime" ? appearance.realtimeEdgeEnabled : mode === "chat" ? appearance.edgeEnabled : false;
     if (shouldShowEdge) void beginEdge(0.2);
     const useAiDictation = mode === "dictation" && appearance.dictationMode === "ai";
+    let microphoneStream: MediaStream | null = null;
     if (!useAiDictation) {
       const Constructor = browserSpeechConstructor();
       if (!Constructor) {
@@ -1184,7 +1392,8 @@ export function Capsule() {
       const text = appendSpeechSegment(finalTranscriptRef.current, interim);
       transcriptRef.current = text;
       dictationLastResultAt.current = performance.now();
-      setDraft(text);
+      if (mode === "dictation") setDictationTranscript(text);
+      else setDraft(text);
       };
       const resumeDictationIfHeld = () => {
       if (!listeningRef.current || listeningMode.current !== "dictation" || !dictationHeldRef.current) return false;
@@ -1223,8 +1432,40 @@ export function Capsule() {
       }
     }
 
+    const startBatchRecorder = (mediaStream: MediaStream) => {
+      const mimeType = dictationRecorderMimeType();
+      if (!mimeType) throw new Error("当前系统不支持 AI 语音识别所需的音频录制格式");
+      const recorder = new MediaRecorder(mediaStream, { mimeType, audioBitsPerSecond: 48_000 });
+      dictationAudioChunks.current = [];
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) dictationAudioChunks.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        const chunks = dictationAudioChunks.current;
+        dictationAudioChunks.current = [];
+        dictationRecorder.current = null;
+        const audio = new Blob(chunks, { type: recorder.mimeType || mimeType });
+        if (audio.size > 0) void finishAiDictation(audio);
+        else stopListeningRef.current?.(false);
+      };
+      recorder.onerror = () => stopListeningRef.current?.(false);
+      dictationRecorder.current = recorder;
+      recorder.start();
+    };
+
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
+      let configuredModel = "";
+      if (useAiDictation) {
+        try {
+          const config = await invoke<{ model: string }>("get_dictation_asr_config");
+          configuredModel = config.model;
+        } catch {
+          configuredModel = "";
+        }
+      }
+      const useRealtime = useAiDictation && isStreamDictationModelName(configuredModel);
+      // 麦克风与流式识别会话并行启动，压缩按下 Alt 到开始识别的延迟。
+      const streamPromise = navigator.mediaDevices.getUserMedia({
         audio: {
           autoGainControl: true,
           noiseSuppression: true,
@@ -1232,72 +1473,87 @@ export function Capsule() {
           channelCount: { ideal: 1 },
           sampleRate: { ideal: 48000 },
         },
+      }).catch((error) => {
+        throw error;
       });
-      if (!listeningRef.current || listeningMode.current !== mode || (useAiDictation && dictationStopRequested.current)) {
+      let realtimeSession: { sessionId: string; sampleRate: number } | null = null;
+      if (useRealtime) {
+        try {
+          realtimeSession = await invoke<{ sessionId: string; sampleRate: number }>("start_realtime_dictation");
+          if (realtimeSession) realtimeDictationSessionId.current = realtimeSession.sessionId;
+        } catch (error) {
+          console.warn("流式语音识别启动失败，回退整段识别", error);
+          realtimeSession = null;
+        }
+      }
+      const stream = await streamPromise;
+      microphoneStream = stream;
+      if (dictationFlowId.current !== flowId || !listeningRef.current || listeningMode.current !== mode || (useAiDictation && dictationStopRequested.current)) {
+        if (realtimeSession) void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
+        realtimeDictationSessionId.current = null;
         stream.getTracks().forEach((track) => track.stop());
         return;
       }
       if (useAiDictation) {
-        const config = await invoke<{ model: string }>("get_dictation_asr_config");
-        const realtimeModel = config.model.toLowerCase().includes("realtime");
-        if (realtimeModel) {
-          setDictationStatus("正在连接 AI 实时语音识别");
-          const realtimeSession = await invoke<{ sessionId: string; sampleRate: number }>("start_realtime_dictation");
-          if (!listeningRef.current || listeningMode.current !== mode || dictationStopRequested.current) {
-            await invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
-            stream.getTracks().forEach((track) => track.stop());
-            return;
-          }
+        setDictationPhase("listening");
+        let captureActive = false;
+        if (realtimeSession) {
           const outputRate = realtimeSession.sampleRate;
           const captureContext = new AudioContext({ latencyHint: "interactive" });
+          if (captureContext.state === "suspended") await captureContext.resume().catch(() => undefined);
           const captureSource = captureContext.createMediaStreamSource(stream);
-          const processor = captureContext.createScriptProcessor(2048, 1, 1);
           const silentGain = captureContext.createGain();
           silentGain.gain.value = 0;
-          const capture: RealtimeDictationCapture = {
-            context: captureContext,
-            processor,
-            source: captureSource,
-            silentGain,
-            sessionId: realtimeSession.sessionId,
-            sendQueue: Promise.resolve(),
-            sampleRate: outputRate,
-          };
-          realtimeDictationText.current = "";
-          realtimeDictationWritten.current = "";
-          realtimeDictationInputFailed.current = false;
-          processor.onaudioprocess = (event) => {
-            const pcm = downsamplePcmTo16Bit(event.inputBuffer.getChannelData(0), captureContext.sampleRate, outputRate);
-            capture.sendQueue = capture.sendQueue
-              .then(() => invoke("push_realtime_dictation_audio", { sessionId: capture.sessionId, pcmBase64: pcmToBase64([pcm]) }).then(() => undefined))
-              .catch(() => undefined);
-          };
-          captureSource.connect(processor);
-          processor.connect(silentGain);
-          silentGain.connect(captureContext.destination);
-          realtimeDictationCapture.current = capture;
-          realtimeDictationSessionId.current = capture.sessionId;
-          setDictationStatus("正在实时听写");
-        } else {
-          const mimeType = dictationRecorderMimeType();
-          if (!mimeType) throw new Error("当前系统不支持 AI 语音识别所需的音频录制格式");
-          const recorder = new MediaRecorder(stream, { mimeType, audioBitsPerSecond: 48_000 });
-          dictationAudioChunks.current = [];
-          recorder.ondataavailable = (event) => {
-            if (event.data.size > 0) dictationAudioChunks.current.push(event.data);
-          };
-          recorder.onstop = () => {
-            const chunks = dictationAudioChunks.current;
-            dictationAudioChunks.current = [];
-            dictationRecorder.current = null;
-            const audio = new Blob(chunks, { type: recorder.mimeType || mimeType });
-            if (audio.size > 0) void finishAiDictation(audio);
-            else stopListeningRef.current?.(false);
-          };
-          recorder.onerror = () => stopListeningRef.current?.(false);
-          dictationRecorder.current = recorder;
-          recorder.start();
+          try {
+            const worklet = await createPcmWorkletNode(captureContext, outputRate);
+            const capture: RealtimeDictationCapture = {
+              context: captureContext,
+              processor: worklet,
+              source: captureSource,
+              silentGain,
+              sessionId: realtimeSession.sessionId,
+              sendQueue: Promise.resolve(),
+              sampleRate: outputRate,
+            };
+            realtimeDictationText.current = "";
+            realtimeDictationWritten.current = "";
+            realtimeDictationInputFailed.current = false;
+            worklet.port.onmessage = (event) => {
+              const pcm = new Int16Array(event.data as ArrayBuffer);
+              capture.sendQueue = capture.sendQueue
+                .then(() => invoke("push_realtime_dictation_audio", { sessionId: capture.sessionId, pcmBase64: pcmToBase64([pcm]) }).then(() => undefined))
+                .catch(() => undefined);
+            };
+            captureSource.connect(worklet);
+            worklet.connect(silentGain);
+            silentGain.connect(captureContext.destination);
+            realtimeDictationCapture.current = capture;
+            realtimeDictationSessionId.current = capture.sessionId;
+            captureActive = true;
+            // 并行录制整段音频：流式会话中途失败且没有转写时，用它走批量识别兜底。
+            const fallbackMime = dictationRecorderMimeType();
+            if (fallbackMime) {
+              try {
+                const fallbackRecorder = new MediaRecorder(stream, { mimeType: fallbackMime, audioBitsPerSecond: 48_000 });
+                realtimeFallbackChunks.current = [];
+                fallbackRecorder.ondataavailable = (event) => {
+                  if (event.data.size > 0) realtimeFallbackChunks.current.push(event.data);
+                };
+                realtimeFallbackRecorder.current = fallbackRecorder;
+                fallbackRecorder.start();
+              } catch {
+                // 兜底录音不可用只损失降级能力，不影响流式识别。
+              }
+            }
+          } catch (error) {
+            console.warn("流式音频采集不可用，回退整段识别", error);
+            void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
+            realtimeDictationSessionId.current = null;
+            captureContext.close().catch(() => undefined);
+            captureActive = false;
+          }
         }
+        if (!captureActive) startBatchRecorder(stream);
       }
       const context = new AudioContext({ latencyHint: "interactive" });
       if (context.state === "suspended") await context.resume();
@@ -1337,10 +1593,26 @@ export function Capsule() {
         if (voiceResources.current) voiceResources.current.animationFrame = requestAnimationFrame(animate);
       };
       voiceResources.current = { stream, context, animationFrame: requestAnimationFrame(animate) };
-    } catch {
+    } catch (error) {
+      // The recorder can already be running when the optional AudioContext used
+      // for the wave animation fails to initialize. Do not discard a valid AI
+      // dictation recording just because its visual meter is unavailable.
+      if (useAiDictation && dictationRecorder.current?.state === "recording") {
+        console.warn("AI dictation level meter unavailable; keeping audio recording active", error);
+        // Keep ownership of the microphone stream so finishAiDictation can
+        // release it after the recorder submits its audio.
+        if (microphoneStream) voiceResources.current = { stream: microphoneStream, animationFrame: 0 };
+        return;
+      }
+      // 麦克风或采集链路失败时，先启动的流式会话必须收掉，避免悬挂的后台任务。
+      if (realtimeDictationSessionId.current && !realtimeDictationCapture.current) {
+        const orphanSessionId = realtimeDictationSessionId.current;
+        realtimeDictationSessionId.current = null;
+        void invoke("finish_realtime_dictation", { sessionId: orphanSessionId }).catch(() => undefined);
+      }
       stopListening(false);
     }
-  }, [appearance.autoSend, appearance.dictationEdgeEnabled, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, beginEdge, closeContextMenu, emitEdge, finishAiDictation, finishRealtimeAiDictation, requestDictationStop, stopListening]);
+  }, [appearance.autoSend, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, beginEdge, closeContextMenu, emitEdge, finishAiDictation, requestDictationStop, stopListening]);
 
   startListeningRef.current = startListening;
 
@@ -1507,107 +1779,103 @@ export function Capsule() {
     let unlisten: (() => void) | undefined;
     void listen<RealtimeDictationEvent>("kero:realtime-dictation", ({ payload }) => {
       if (!payload || payload.sessionId !== realtimeDictationSessionId.current) return;
-      if (payload.text) {
-        const transcript = payload.text.trim();
-        if (!transcript) return;
-        realtimeDictationText.current = transcript;
-        transcriptRef.current = transcript;
-        finalTranscriptRef.current = transcript;
-        setDictationStatus("正在实时听写");
-        // The recognizer returns the current sentence repeatedly as it refines it.
-        // Replace only the text Kero inserted in the target, never the user's earlier text.
-        if (transcript !== realtimeDictationWritten.current) {
-          const previousWritten = realtimeDictationWritten.current;
-          realtimeDictationWritten.current = transcript;
-          realtimeDictationInsertQueue.current = realtimeDictationInsertQueue.current
-            .then(() => invoke("replace_realtime_dictation_text", { previous: previousWritten, text: transcript }).then(() => undefined))
-            .catch(() => {
-              realtimeDictationWritten.current = previousWritten;
-              realtimeDictationInputFailed.current = true;
-            });
+      const incoming = (payload.fullText ?? payload.text ?? "").trim();
+      if (incoming) {
+        realtimeDictationText.current = incoming;
+        transcriptRef.current = incoming;
+        finalTranscriptRef.current = incoming;
+        setDictationTranscript(incoming);
+        // 实时打入目标输入框：250ms 节流合并，避免连续结果导致"删了打、打了删"；
+        // 松开 Alt 之后停止实时打字，只等最终结果（差量补打 + 润色替换）。
+        realtimePendingWritten.current = incoming;
+        if (!dictationStopRequested.current && incoming !== realtimeDictationWritten.current && realtimeReplaceTimer.current === null) {
+          realtimeReplaceTimer.current = window.setTimeout(() => {
+            realtimeReplaceTimer.current = null;
+            applyRealtimeReplace();
+          }, 250);
         }
       }
       if (!payload.done) return;
       realtimeDictationSessionId.current = null;
-      const transcript = realtimeDictationText.current.trim();
+      const flowId = dictationFlowId.current;
+      const transcript = (incoming || realtimeDictationText.current).trim();
       realtimeDictationText.current = "";
-      if (payload.error) {
-        void invoke("clear_dictation_focus_target");
+      const resetToListeningOff = () => {
         releaseVoice();
         listeningRef.current = false;
         listeningMode.current = "chat";
         setListening(false);
         setIsDictating(false);
-        setDictationStatus(payload.error);
-        if (appearance.dictationEdgeEnabled) endEdge();
-        hideAfterTrayDictation();
+      };
+      if (payload.error) {
+        resetToListeningOff();
+        const fallbackBlob = takeRealtimeFallbackBlob();
+        if (!transcript && fallbackBlob) {
+          // 流式会话失败且没有任何转写 → 用并行录制的整段音频走批量识别。
+          void finishAiDictation(fallbackBlob);
+          return;
+        }
+        void invoke("clear_dictation_focus_target");
+        if (transcript) dictationFinalTextRef.current = transcript;
+        setDictationError(payload.error);
+        setDictationPhase("error");
         return;
       }
       if (!transcript) {
+        resetToListeningOff();
         void invoke("clear_dictation_focus_target");
-        releaseVoice();
-        listeningRef.current = false;
-        listeningMode.current = "chat";
-        setListening(false);
-        setIsDictating(false);
-        setDictationStatus("AI 实时语音识别没有听到有效内容");
-        if (appearance.dictationEdgeEnabled) endEdge();
-        hideAfterTrayDictation();
+        setDictationError("没有听到有效内容，再试一次吧");
+        setDictationPhase("error");
         return;
       }
+      setDictationTranscript(transcript);
       if (appearance.aiDictationPolish) {
-        releaseVoice();
-        listeningRef.current = false;
-        listeningMode.current = "chat";
-        setListening(false);
-        setIsDictating(false);
-        setDictationStatus("正在由 AI 理解并整理");
+        resetToListeningOff();
+        setDictationPhase("polishing");
         const beforePolish = realtimeDictationWritten.current;
-        const vocabulary = readDictationVocabulary().join("\n");
         void invoke<string>("optimize_dictation", {
           text: transcript,
           correctTypos: appearance.dictationCorrection,
-          vocabulary,
+          vocabulary: readDictationVocabulary().join("\n"),
           memory: appearance.dictationMemory ? readDictationMemory().join("\n") : undefined,
-        }).catch(() => transcript).then((optimized) => {
+        }).catch(() => transcript).then(async (optimized) => {
+          if (dictationFlowId.current !== flowId) return;
           const text = optimized.trim() || transcript;
+          dictationFinalTextRef.current = text;
           if (appearance.dictationMemory) rememberDictation(text);
-          return realtimeDictationInsertQueue.current
-            .then(() => invoke("replace_realtime_dictation_text", { previous: beforePolish, text }).then(() => undefined))
-            .then(() => { realtimeDictationWritten.current = ""; setDraft(""); })
-            .catch(() => {
-              realtimeDictationInputFailed.current = true;
-              setDraft(text);
-            });
-        }).finally(() => {
-          void invoke("clear_dictation_focus_target");
-          setDictationStatus(realtimeDictationInputFailed.current
-            ? "无法恢复原输入框，识别内容已保留在胶囊中。"
-            : "");
-          if (appearance.dictationEdgeEnabled) endEdge();
-          if (!realtimeDictationInputFailed.current) hideAfterTrayDictation();
+          setDictationPhase("inserting");
+          try {
+            await realtimeDictationInsertQueue.current;
+            await invoke("replace_realtime_dictation_text", { previous: beforePolish, text });
+            if (dictationFlowId.current !== flowId) return;
+            realtimeDictationWritten.current = "";
+            closeDictationPanel();
+          } catch {
+            realtimeDictationInputFailed.current = true;
+            setDictationError("无法写入原输入框，可重试或复制内容");
+            setDictationPhase("error");
+          }
         });
       } else {
-        releaseVoice();
-        listeningRef.current = false;
-        listeningMode.current = "chat";
-        setListening(false);
-        setIsDictating(false);
-        realtimeDictationWritten.current = "";
-        void invoke("clear_dictation_focus_target");
-        if (realtimeDictationInputFailed.current) {
-          setDraft(transcript);
-          setDictationStatus("无法恢复原输入框，识别内容已保留在胶囊中。");
-        } else {
-          setDraft("");
-          setDictationStatus("");
-        }
-        if (appearance.dictationEdgeEnabled) endEdge();
-        if (!realtimeDictationInputFailed.current) hideAfterTrayDictation();
+        resetToListeningOff();
+        // 收尾补打：松开 Alt 后被节流掉的尾部在这里一次性写入（差量，内容一致时无击键）。
+        void realtimeDictationInsertQueue.current.then(async () => {
+          if (dictationFlowId.current !== flowId) return;
+          try {
+            await invoke("replace_realtime_dictation_text", { previous: realtimeDictationWritten.current, text: transcript });
+            if (dictationFlowId.current !== flowId) return;
+            realtimeDictationWritten.current = "";
+            closeDictationPanel();
+          } catch {
+            dictationFinalTextRef.current = transcript;
+            setDictationError("无法写入原输入框, 可重试或复制内容");
+            setDictationPhase("error");
+          }
+        });
       }
     }).then((listener) => { unlisten = listener; });
     return () => unlisten?.();
-  }, [appearance.aiDictationPolish, appearance.dictationCorrection, appearance.dictationEdgeEnabled, appearance.dictationMemory, endEdge, hideAfterTrayDictation, releaseVoice]);
+  }, [appearance.aiDictationPolish, appearance.dictationCorrection, appearance.dictationMemory, applyRealtimeReplace, closeDictationPanel, finishAiDictation, releaseVoice, takeRealtimeFallbackBlob]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -1645,15 +1913,66 @@ export function Capsule() {
   }, [updateAppearance]);
 
   useEffect(() => {
+    if (dictationPanel) {
+      // 千问式听写条：直接出现在屏幕底部、任务栏上方、水平居中，不做从胶囊形变过来的动画。
+      let cancelled = false;
+      void (async () => {
+        const win = getCurrentWindow();
+        const [position, scale, workArea] = await Promise.all([
+          win.outerPosition().catch(() => null),
+          win.scaleFactor().catch(() => 1),
+          invoke<WorkArea>("get_work_area").catch(() => null),
+        ]);
+        // origin 为空说明这一轮听写条还没定位过：直接切换出现，之后的长宽变化才走动画。
+        const firstPlacement = position !== null && !dictationGrowOrigin.current;
+        if (position && !dictationGrowOrigin.current) {
+          dictationGrowOrigin.current = { x: position.x, y: position.y };
+        }
+        let restoreX: number | undefined;
+        let restoreY: number | undefined;
+        if (workArea) {
+          const scaleValue = scale || 1;
+          const pillPhysicalWidth = Math.round(dictationWidth * scaleValue);
+          const pillPhysicalHeight = Math.round(dictationPillHeight * scaleValue);
+          const margin = Math.round(16 * scaleValue);
+          restoreX = workArea.x + Math.round((workArea.width - pillPhysicalWidth) / 2);
+          restoreY = workArea.y + workArea.height - pillPhysicalHeight - margin;
+        }
+        if (cancelled) return;
+        if (firstPlacement) {
+          await invoke("hide_window", { label: "main" }).catch(() => undefined);
+          await invoke("set_main_size", { width: dictationWidth, height: dictationPillHeight, restoreX, restoreY, animate: false }).catch(() => undefined);
+          if (cancelled) return;
+          await invoke("show_main_passive").catch(() => undefined);
+        } else {
+          await invoke("set_main_size", { width: dictationWidth, height: dictationPillHeight, restoreX, restoreY }).catch(() => undefined);
+        }
+      })();
+      return () => {
+        cancelled = true;
+      };
+    }
     const height = menuOpen ? contextMenuHeight : realtimePermissionOpen ? 174 : conversationVisible ? inlineHeight : 72;
     const restore = conversationVisible ? null : collapseTarget;
+    if (dictationGrowOrigin.current && !conversationVisible && !menuOpen && !realtimePermissionOpen) {
+      // 听写结束：胶囊直接在原位恢复，不做收回去的动画；从托盘唤起的保持隐藏。
+      const origin = dictationGrowOrigin.current;
+      dictationGrowOrigin.current = null;
+      const restoreShow = !dictationStartedHidden.current;
+      void (async () => {
+        await invoke("hide_window", { label: "main" }).catch(() => undefined);
+        await invoke("set_main_size", { width: currentWidth, height, restoreX: origin.x, restoreY: origin.y, animate: false }).catch(() => undefined);
+        if (restoreShow) await invoke("show_main_passive").catch(() => undefined);
+      })();
+      return undefined;
+    }
     void invoke("set_main_size", { width: currentWidth, height, restoreX: restore?.x, restoreY: restore?.y });
     if (restore) {
       const timer = window.setTimeout(() => setCollapseTarget(null), 240);
       return () => window.clearTimeout(timer);
     }
     return undefined;
-  }, [collapseTarget, conversationVisible, currentWidth, inlineHeight, menuOpen, realtimePermissionOpen]);
+  }, [collapseTarget, conversationVisible, currentWidth, dictationPillHeight, dictationPanel, dictationWidth, inlineHeight, menuOpen, realtimePermissionOpen]);
 
   useEffect(() => {
     window.localStorage.setItem("kero-inline-history", JSON.stringify(messages));
@@ -1685,6 +2004,7 @@ export function Capsule() {
             return;
           }
           await startListening("dictation");
+          dictationStartedHidden.current = wasHidden;
           // A blocked microphone or an interrupted startup must not leave a tray-only capsule visible.
           if (wasHidden && !listeningRef.current) hideAfterTrayDictation();
         } catch (error) {
@@ -1696,12 +2016,17 @@ export function Capsule() {
     void listen("kero:shortcut-dictation-stop", () => {
       requestDictationStop();
     }).then((unlisten) => { stopDictationEnd = unlisten; });
+    let stopDictationCancel: (() => void) | undefined;
+    void listen("kero:shortcut-dictation-cancel", () => {
+      cancelDictation();
+    }).then((unlisten) => { stopDictationCancel = unlisten; });
     return () => {
       stopClickThrough?.();
       stopDictationStart?.();
       stopDictationEnd?.();
+      stopDictationCancel?.();
     };
-  }, [hideAfterTrayDictation, requestDictationStop, startListening, updateAppearance]);
+  }, [cancelDictation, hideAfterTrayDictation, requestDictationStop, startListening, updateAppearance]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -1713,8 +2038,8 @@ export function Capsule() {
 
   useEffect(() => () => {
     releaseVoice();
-    if (altKeyPoll.current !== null) window.clearInterval(altKeyPoll.current);
     if (dictationStopTimer.current !== null) window.clearTimeout(dictationStopTimer.current);
+    if (realtimeReplaceTimer.current !== null) window.clearTimeout(realtimeReplaceTimer.current);
   }, [releaseVoice]);
 
   const openContextMenu = (event: ReactMouseEvent<HTMLElement>) => {
@@ -1829,14 +2154,59 @@ export function Capsule() {
       }}
     >
       <section
-        className={`capsule reference-capsule ${appearance.glassEnabled ? "is-live-glass" : "is-solid"}`}
+        className={`capsule reference-capsule ${dictationPanel ? "is-dictation-pill" : appearance.glassEnabled ? "is-live-glass" : "is-solid"}`}
         ref={capsuleRef}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={() => { dragOrigin.current = null; }}
         onContextMenu={openContextMenu}
       >
-        {conversationVisible && (
+        {dictationPanel && (
+          <div className="dictation-pill">
+            <button type="button" className="dictation-end" title="取消听写 (Esc)" onClick={cancelDictation}><X size={13} /></button>
+            <div
+              className={`dictation-middle ${dictationPhase === "polishing" ? "is-polishing" : ""}`}
+              ref={dictationTranscriptRef}
+              title={dictationPhase === "error" ? (dictationError || "无法写入原输入框") : undefined}
+            >
+              {dictationPhase === "error" ? (
+                <span className="dictation-error-msg">{dictationError || "无法写入原输入框"}</span>
+              ) : dictationTranscript ? (
+                <>
+                  <span className="dictation-text-content">{dictationTranscript}</span>
+                  {dictationPhase === "listening" && (
+                    <span className="dictation-live-wave" aria-hidden="true">
+                      {[0.62, 0.92, 1, 0.78].map((factor, index) => (
+                        <i key={index} style={{ height: `${Math.max(3, (5 + voiceEnergy * 13) * factor)}px` }} />
+                      ))}
+                    </span>
+                  )}
+                </>
+              ) : dictationPhase === "listening" ? (
+                <span className="dictation-live-wave is-strip" aria-hidden="true">
+                  {dictationWaveFactors.map((factor, index) => (
+                    <i key={index} style={{ height: `${Math.max(3, (4 + voiceEnergy * 16) * factor)}px` }} />
+                  ))}
+                </span>
+              ) : (
+                <span className="dictation-live-wave is-strip is-working" aria-hidden="true">
+                  {dictationWaveFactors.map((factor, index) => <i key={index} />)}
+                </span>
+              )}
+            </div>
+            {dictationPhase === "error" && (
+              <button type="button" className="dictation-end" title="复制内容" onClick={() => void copyDictationText()}><Copy size={12} /></button>
+            )}
+            <button
+              type="button"
+              className="dictation-end is-confirm"
+              title={dictationPhase === "error" ? "重试写入" : "结束并写入"}
+              disabled={dictationPhase !== "listening" && dictationPhase !== "error"}
+              onClick={confirmDictation}
+            >{dictationPhase === "error" ? <RotateCcw size={13} /> : <Check size={14} />}</button>
+          </div>
+        )}
+        {!dictationPanel && conversationVisible && (
           <div className="inline-chat" aria-live="polite">
             <div className="inline-chat-head">
               <span>{mcpActive ? <BrainCircuit size={14} /> : computerRunning ? <MousePointer2 size={14} /> : <Waves size={14} />} {visibleComputerControl ? computerStatus || "正在操控电脑" : "Kero"}</span>
@@ -1892,7 +2262,7 @@ export function Capsule() {
             )}
           </div>
         )}
-        {realtimePermissionOpen && (
+        {!dictationPanel && realtimePermissionOpen && (
           <div className="realtime-permission" role="dialog" aria-label="实时通话屏幕访问确认">
             <div><MonitorUp size={18} /><span><b>允许 AI 查看主屏幕？</b><small>仅在你说完问题时发送一帧画面。</small></span></div>
             <section>
@@ -1901,59 +2271,61 @@ export function Capsule() {
             </section>
           </div>
         )}
-        <div className="capsule-composer">
-          <button
-            className={`voice-disc ${listening ? "is-listening" : ""}`}
-            type="button"
-            title={listening ? "结束语音输入" : "语音输入"}
-            onClick={() => (listening ? stopListening(true) : void startListening())}
-            disabled={isStreaming}
-          >
-            {listening ? <Square size={15} fill="currentColor" /> : <AudioLines size={24} strokeWidth={2.2} />}
-          </button>
-          {(listening || dictationProcessing || realtimeActive || screenTranslationActive) && (
-            <div className={`voice-wave ${isDictating ? "is-dictating" : ""} ${dictationProcessing ? "is-processing" : ""}`} aria-label={dictationStatus || (isDictating ? "正在听写" : "正在聆听")}>
-              {[0.58, 0.82, 1, 0.82, 0.58].map((factor, index) => <i key={index} style={{ transform: `scaleY(${0.34 + voiceEnergy * (1.2 + factor)})` }} />)}
-              <small>{dictationStatus || (screenTranslationActive ? "实时翻译中" : realtimeActive ? "实时通话中" : isDictating ? "听写中" : "聆听中")}</small>
-            </div>
-          )}
-          <form className="reference-form" onSubmit={submit}>
-            <input
-              className="reference-input"
-              value={draft}
-              onChange={(event) => setDraft(event.target.value)}
-              placeholder={mcpActive ? "MCP 操控中，可在 Codex 中补充要求" : computerRunning ? "补充或修正当前电脑操作" : listening ? "正在聆听，停顿后自动发送" : isStreaming ? "Kero 正在回复" : "和 Kero 对话"}
-              aria-label="发送给 Kero 的消息"
-              disabled={mcpActive || (isStreaming && !computerRunning)}
-            />
-          </form>
-          {draft.trim()
-            ? <button
-                className="composer-send"
-                type="button"
-                title="发送消息"
-                aria-label="发送消息"
-                onClick={() => void sendPrompt(draft)}
+        {!dictationPanel && (
+          <div className="capsule-composer">
+            <button
+              className={`voice-disc ${listening ? "is-listening" : ""}`}
+              type="button"
+              title={listening ? "结束语音输入" : "语音输入"}
+              onClick={() => (listening ? stopListening(true) : void startListening())}
+              disabled={isStreaming}
+            >
+              {listening ? <Square size={15} fill="currentColor" /> : <AudioLines size={24} strokeWidth={2.2} />}
+            </button>
+            {(listening || dictationProcessing || realtimeActive || screenTranslationActive) && (
+              <div className={`voice-wave ${isDictating ? "is-dictating" : ""} ${dictationProcessing ? "is-processing" : ""}`} aria-label={dictationStatus || (isDictating ? "正在听写" : "正在聆听")}>
+                {[0.58, 0.82, 1, 0.82, 0.58].map((factor, index) => <i key={index} style={{ transform: `scaleY(${0.34 + voiceEnergy * (1.2 + factor)})` }} />)}
+                <small>{dictationStatus || (screenTranslationActive ? "实时翻译中" : realtimeActive ? "实时通话中" : isDictating ? "听写中" : "聆听中")}</small>
+              </div>
+            )}
+            <form className="reference-form" onSubmit={submit}>
+              <input
+                className="reference-input"
+                value={draft}
+                onChange={(event) => setDraft(event.target.value)}
+                placeholder={mcpActive ? "MCP 操控中，可在 Codex 中补充要求" : computerRunning ? "补充或修正当前电脑操作" : listening ? "正在聆听，停顿后自动发送" : isStreaming ? "Kero 正在回复" : "和 Kero 对话"}
+                aria-label="发送给 Kero 的消息"
                 disabled={mcpActive || (isStreaming && !computerRunning)}
-              ><SendHorizontal size={18} strokeWidth={2.25} /></button>
-            : screenTranslationReady
+              />
+            </form>
+            {draft.trim()
               ? <button
-                  className="realtime-disc translation-close"
+                  className="composer-send"
                   type="button"
-                  title="关闭全屏翻译"
-                  aria-label="关闭全屏翻译"
-                  onClick={() => void handleScreenTranslationCommand("stop", "关闭全屏翻译")}
-                ><X size={19} strokeWidth={2.3} /></button>
-              : <button
-                className={`realtime-disc ${realtimeActive ? "is-active" : ""}`}
-                type="button"
-                title={screenTranslationActive ? "翻译中" : realtimeActive ? "结束实时通话" : "开启屏幕感知实时通话"}
-                onClick={() => { if (realtimeActive) stopRealtimeCall(); else setRealtimePermissionOpen(true); }}
-                disabled={screenTranslationActive || (isStreaming && !realtimeActive)}
-              >
-                {realtimeActive ? <Square size={14} fill="currentColor" /> : <MonitorUp size={19} />}
-              </button>}
-        </div>
+                  title="发送消息"
+                  aria-label="发送消息"
+                  onClick={() => void sendPrompt(draft)}
+                  disabled={mcpActive || (isStreaming && !computerRunning)}
+                ><SendHorizontal size={18} strokeWidth={2.25} /></button>
+              : screenTranslationReady
+                ? <button
+                    className="realtime-disc translation-close"
+                    type="button"
+                    title="关闭全屏翻译"
+                    aria-label="关闭全屏翻译"
+                    onClick={() => void handleScreenTranslationCommand("stop", "关闭全屏翻译")}
+                  ><X size={19} strokeWidth={2.3} /></button>
+                : <button
+                  className={`realtime-disc ${realtimeActive ? "is-active" : ""}`}
+                  type="button"
+                  title={screenTranslationActive ? "翻译中" : realtimeActive ? "结束实时通话" : "开启屏幕感知实时通话"}
+                  onClick={() => { if (realtimeActive) stopRealtimeCall(); else setRealtimePermissionOpen(true); }}
+                  disabled={screenTranslationActive || (isStreaming && !realtimeActive)}
+                >
+                  {realtimeActive ? <Square size={14} fill="currentColor" /> : <MonitorUp size={19} />}
+                </button>}
+          </div>
+        )}
       </section>
 
       {contextMenu && (
