@@ -1351,7 +1351,6 @@ export function Capsule() {
     if (mode === "dictation") setDictationPhase("listening");
     listeningRef.current = true;
     listeningMode.current = mode;
-    if (mode === "dictation") dictationStartedHidden.current = false;
     closeContextMenu();
     if (mode === "dictation") {
       void invoke("warm_dictation_service").catch(() => undefined);
@@ -1998,13 +1997,15 @@ export function Capsule() {
           const wasHidden = await invoke<boolean>("show_main_passive");
           if (dictationSessionId.current !== sessionId) return;
           dictationOpenedFromTray.current = wasHidden;
+          // 必须在 startListening 之前记录：快速松开 Alt 时听写可能在 startListening 返回前就结束，
+          // 收起逻辑靠这个标记决定是否恢复显示，否则从托盘唤起的听写会把胶囊重新弹出来。
+          dictationStartedHidden.current = wasHidden;
           trayDictationSessionId.current = wasHidden ? sessionId : null;
           if (!dictationHeldRef.current) {
             hideAfterTrayDictation();
             return;
           }
           await startListening("dictation");
-          dictationStartedHidden.current = wasHidden;
           // A blocked microphone or an interrupted startup must not leave a tray-only capsule visible.
           if (wasHidden && !listeningRef.current) hideAfterTrayDictation();
         } catch (error) {
