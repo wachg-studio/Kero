@@ -300,6 +300,8 @@ export function SettingsWindow() {
       });
       setDictationAsr({ ...saved, apiKey: "" });
       setDictationAsrNotice("AI 语音识别配置已保存，密钥已单独加密保护");
+      // 通知胶囊窗口重新评估是否启用 Alt 按下时的流式预连接。
+      void emitTo("main", "kero:asr-saved", {}).catch(() => undefined);
     } catch (error) {
       setDictationAsrNotice(error instanceof Error ? error.message : String(error));
     } finally {

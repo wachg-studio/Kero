@@ -526,6 +526,37 @@ export function Capsule() {
     };
   }, []);
 
+  const refreshRealtimeHint = useCallback(() => {
+    // 告知后端当前是否使用流式模型（决定 Alt 按下时是否预建连接），并同步词表供热词上下文。
+    void (async () => {
+      try {
+        if (appearance.dictationMode !== "ai") {
+          await invoke("set_realtime_preconnect_hint", { enabled: false });
+          return;
+        }
+        const config = await invoke<{ model: string }>("get_dictation_asr_config");
+        await invoke("set_realtime_preconnect_hint", {
+          enabled: isStreamDictationModelName(config.model),
+          vocabulary: readDictationVocabulary().join("\n"),
+        });
+      } catch {
+        // 提示同步失败只影响预连接加速，不影响听写功能。
+      }
+    })();
+  }, [appearance.dictationMode]);
+
+  useEffect(() => {
+    refreshRealtimeHint();
+  }, [refreshRealtimeHint]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen("kero:asr-saved", () => refreshRealtimeHint()).then((listener) => {
+      unlisten = listener;
+    });
+    return () => unlisten?.();
+  }, [refreshRealtimeHint]);
+
   const conversationVisible = conversationOpen && (messages.length > 0 || mcpActive);
   const menuOpen = contextMenu !== null;
   const dictationProcessing = Boolean(dictationStatus);
@@ -1486,7 +1517,9 @@ export function Capsule() {
       let realtimeSession: { sessionId: string; sampleRate: number } | null = null;
       if (useRealtime) {
         try {
-          realtimeSession = await invoke<{ sessionId: string; sampleRate: number }>("start_realtime_dictation");
+          realtimeSession = await invoke<{ sessionId: string; sampleRate: number }>("start_realtime_dictation", {
+            vocabulary: readDictationVocabulary().join("\n"),
+          });
           if (realtimeSession) realtimeDictationSessionId.current = realtimeSession.sessionId;
         } catch (error) {
           console.warn("流式语音识别启动失败，回退整段识别", error);
@@ -1599,7 +1632,8 @@ export function Capsule() {
         const level = Math.min(1, Math.sqrt(total / samples.length) * 4.8);
         if (now - lastEmission > 74) {
           if (shouldShowEdge) emitEdge(true, 0.24 + level * 0.76);
-          setVoiceEnergy(level);
+          // 波形变化小于阈值时跳过渲染，降低听写期间的 React 更新频率。
+          setVoiceEnergy((previous) => (Math.abs(previous - level) < 0.02 ? previous : level));
           lastEmission = now;
         }
 

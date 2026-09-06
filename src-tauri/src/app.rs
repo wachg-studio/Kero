@@ -65,6 +65,183 @@ enum RealtimeDictationCommand {
     Finish,
 }
 
+// Alt 按下即预连接的实时识别会话：前端麦克风就绪后直接认领，省掉 200~500ms 建连时间。
+struct PreconnectedRealtime {
+    socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    created_at: std::time::Instant,
+}
+
+static REALTIME_PRECONNECT: std::sync::Mutex<Option<PreconnectedRealtime>> = std::sync::Mutex::new(None);
+// 前端告知当前是否使用流式识别模型；避免非流式用户每次按 Alt 都白建一条连接。
+static REALTIME_PRECONNECT_HINT: AtomicBool = AtomicBool::new(false);
+static REALTIME_VOCABULARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn realtime_preconnect_vocabulary() -> Option<String> {
+    REALTIME_VOCABULARY
+        .lock()
+        .ok()
+        .and_then(|value| value.clone())
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// 把底层连接/接口错误翻译成用户能采取行动的提示。
+fn friendly_realtime_error(message: &str) -> String {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("unauthorized") || lower.contains("invalid api") || lower.contains("invalid_api") {
+        "语音识别 API Key 无效或未授权，请在设置中检查密钥".to_string()
+    } else if lower.contains("throttl") || lower.contains("rate limit") || lower.contains("arrear") {
+        "请求过于频繁或账户额度不足，请稍后再试".to_string()
+    } else if lower.contains("not found") || lower.contains("invalid parameter") && lower.contains("model") {
+        "语音识别模型名称不存在或当前账号无权限使用该模型".to_string()
+    } else if lower.contains("timed out") || lower.contains("timeout") {
+        "连接语音识别服务超时，请检查网络后重试".to_string()
+    } else {
+        message.to_string()
+    }
+}
+
+/// 建立 Qwen3-ASR-Realtime 连接（含认证与协议头），握手由调用方负责。
+async fn connect_qwen_realtime_socket(
+    origin: &str,
+    model: &str,
+    key: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, String> {
+    let mut request = format!("{origin}/api-ws/v1/realtime?model={model}")
+        .into_client_request()
+        .map_err(|error| friendly_realtime_error(&format!("无法准备实时语音识别请求: {error}")))?;
+    request.headers_mut().insert(
+        "Authorization",
+        format!("Bearer {key}")
+            .parse()
+            .map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
+    );
+    request.headers_mut().insert(
+        "OpenAI-Beta",
+        "realtime=v1"
+            .parse()
+            .map_err(|error| format!("无法准备实时语音识别协议头: {error}"))?,
+    );
+    connect_async(request)
+        .await
+        .map(|(socket, _)| socket)
+        .map_err(|error| friendly_realtime_error(&format!("无法连接实时语音识别服务: {error}")))
+}
+
+/// 发送 session.update 并等待确认；携带热词上下文被拒时自动降级为无上下文重试一次。
+async fn qwen_realtime_handshake(
+    socket: &mut tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    sample_rate: u32,
+    context: Option<&str>,
+    timeout_secs: u64,
+) -> Result<(), String> {
+    let session_update = |context: Option<&str>| {
+        let transcription = if context.is_some() {
+            json!({ "language": "zh", "context": context })
+        } else {
+            json!({ "language": "zh" })
+        };
+        json!({
+            "type": "session.update",
+            "session": {
+                "input_audio_format": "pcm",
+                "sample_rate": sample_rate,
+                "input_audio_transcription": transcription,
+                "turn_detection": { "type": "server_vad", "silence_duration_ms": 500 }
+            }
+        })
+        .to_string()
+    };
+    let mut with_context = context.is_some();
+    loop {
+        socket
+            .send(Message::Text(session_update(if with_context { context } else { None }).into()))
+            .await
+            .map_err(|error| format!("无法配置实时语音识别会话: {error}"))?;
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), socket.next())
+            .await
+            .map_err(|_| "实时语音识别启动超时".to_string())?
+            .ok_or_else(|| "实时语音识别服务提前断开".to_string())?
+            .map_err(|error| friendly_realtime_error(&format!("实时语音识别启动失败: {error}")))?;
+        let Message::Text(message) = confirmed else {
+            return Err("实时语音识别返回了无效启动响应".to_string());
+        };
+        let value: Value = serde_json::from_str(&message)
+            .map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
+        match value.get("type").and_then(Value::as_str).unwrap_or_default() {
+            "session.created" | "session.updated" => return Ok(()),
+            "error" => {
+                let detail = value
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("实时语音识别会话配置失败");
+                if with_context {
+                    // 热词上下文字段被服务端拒绝时降级重试，保证听写功能不受影响。
+                    with_context = false;
+                    continue;
+                }
+                return Err(friendly_realtime_error(detail));
+            }
+            _ => return Err("实时语音识别未能建立会话".to_string()),
+        }
+    }
+}
+
+/// Alt 按下时后台预连接：只对已启用流式模型的用户生效，任何失败都静默忽略。
+async fn preconnect_realtime_dictation() {
+    if !REALTIME_PRECONNECT_HINT.load(Ordering::SeqCst) {
+        return;
+    }
+    if REALTIME_PRECONNECT.lock().ok().map(|pool| pool.is_some()).unwrap_or(true) {
+        return;
+    }
+    let Ok(app_config) = load_config() else { return };
+    let config = app_config.dictation_asr;
+    if !is_qwen3_asr_realtime_model(&config.model) {
+        return;
+    }
+    let Some(origin) = dashscope_realtime_asr_origin(config.base_url.trim_end_matches('/')) else {
+        return;
+    };
+    let sample_rate = if config.model.to_ascii_lowercase().contains("8k") { 8_000 } else { 16_000 };
+    let key = match read_secret(DICTATION_ASR_SECRET_ID) {
+        Ok(Some(key)) if !key.trim().is_empty() => key,
+        _ => return,
+    };
+    let mut socket = match connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await {
+        Ok(socket) => socket,
+        Err(_) => return,
+    };
+    let context = realtime_preconnect_vocabulary();
+    if qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 5)
+        .await
+        .is_err()
+    {
+        return;
+    }
+    let mut pool = match REALTIME_PRECONNECT.lock() {
+        Ok(pool) => pool,
+        Err(_) => return,
+    };
+    if pool.is_some() {
+        return;
+    }
+    *pool = Some(PreconnectedRealtime {
+        socket,
+        created_at: std::time::Instant::now(),
+    });
+    // 8 秒内未被认领则丢弃，避免长期挂着的空闲连接。
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(8));
+        if let Ok(mut pool) = REALTIME_PRECONNECT.lock() {
+            if let Some(preconnected) = pool.as_ref() {
+                if preconnected.created_at.elapsed() >= std::time::Duration::from_secs(8) {
+                    *pool = None;
+                }
+            }
+        }
+    });
+}
+
 struct RealtimeDictationSession {
     sender: tokio::sync::mpsc::UnboundedSender<RealtimeDictationCommand>,
 }
@@ -318,6 +495,7 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: usize, data: isize) 
                     tauri::async_runtime::spawn(async {
                         let _ = warm_dictation_service_inner().await;
                     });
+                    tauri::async_runtime::spawn(preconnect_realtime_dictation());
                     if let Some(app) = HOTKEY_APP.get() {
                         let _ = app.emit_to("main", "kero:shortcut-dictation-start", ());
                     }
@@ -2041,7 +2219,10 @@ fn register_realtime_dictation_session(
 }
 
 #[tauri::command]
-async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSessionStart, String> {
+async fn start_realtime_dictation(
+    app: AppHandle,
+    vocabulary: Option<String>,
+) -> Result<RealtimeDictationSessionStart, String> {
     let config = load_config()?.dictation_asr;
     if !is_stream_dictation_model(&config.model) {
         return Err(
@@ -2061,63 +2242,35 @@ async fn start_realtime_dictation(app: AppHandle) -> Result<RealtimeDictationSes
 
     if is_qwen3_asr_realtime_model(&config.model) {
         // ---- Qwen3-ASR-Flash-Realtime：OpenAI-realtime 风格协议 ----
-        let mut request = format!("{origin}/api-ws/v1/realtime?model={}", config.model)
-            .into_client_request()
-            .map_err(|error| format!("无法准备实时语音识别请求: {error}"))?;
-        request.headers_mut().insert(
-            "Authorization",
-            format!("Bearer {key}")
-                .parse()
-                .map_err(|error| format!("无法准备实时语音识别认证: {error}"))?,
-        );
-        request.headers_mut().insert(
-            "OpenAI-Beta",
-            "realtime=v1"
-                .parse()
-                .map_err(|error| format!("无法准备实时语音识别协议头: {error}"))?,
-        );
-        let (mut socket, _) = connect_async(request)
-            .await
-            .map_err(|error| format!("无法连接实时语音识别服务: {error}"))?;
-        socket
-            .send(Message::Text(
-                json!({
-                    "type": "session.update",
-                    "session": {
-                        "input_audio_format": "pcm",
-                        "sample_rate": sample_rate,
-                        "input_audio_transcription": { "language": "zh" },
-                        "turn_detection": {
-                            "type": "server_vad",
-                            "silence_duration_ms": 500
-                        }
-                    }
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .map_err(|error| format!("无法配置实时语音识别会话: {error}"))?;
-        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(8), socket.next())
-            .await
-            .map_err(|_| "实时语音识别启动超时".to_string())?
-            .ok_or_else(|| "实时语音识别服务提前断开".to_string())?
-            .map_err(|error| format!("实时语音识别启动失败: {error}"))?;
-        if let Message::Text(message) = confirmed {
-            let value: Value = serde_json::from_str(&message)
-                .map_err(|_| "实时语音识别返回了无效启动数据".to_string())?;
-            let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
-            if event == "error" {
-                return Err(value
-                    .pointer("/error/message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("实时语音识别会话配置失败")
-                    .to_string());
-            }
-            if event != "session.created" && event != "session.updated" {
-                return Err("实时语音识别未能建立会话".to_string());
+        if let Some(vocabulary) = vocabulary {
+            let compact = vocabulary
+                .split(['\n', ',', ';'])
+                .map(str::trim)
+                .filter(|term| !term.is_empty())
+                .collect::<Vec<_>>()
+                .join(";");
+            if let Ok(mut stored) = REALTIME_VOCABULARY.lock() {
+                *stored = Some(compact.chars().take(400).collect());
             }
         }
+        let context = realtime_preconnect_vocabulary();
+        // 认领 Alt 按下时预建的连接（6 秒内有效），没有预连接时现场建连。
+        let mut socket = match REALTIME_PRECONNECT.lock() {
+            Ok(mut pool) => match pool.take() {
+                Some(preconnected)
+                    if preconnected.created_at.elapsed() <= std::time::Duration::from_secs(6) =>
+                {
+                    Some(preconnected.socket)
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        if socket.is_none() {
+            socket = Some(connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await?);
+        }
+        let mut socket = socket.unwrap();
+        qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 8).await?;
 
         let (session_id, mut receiver) = register_realtime_dictation_session();
         let background_app = app.clone();
@@ -7430,6 +7583,23 @@ fn get_work_area() -> Result<WorkArea, String> {
     Err("仅支持 Windows".to_string())
 }
 
+/// 前端在模式/模型变化时同步：只有确认使用流式模型才允许 Alt 按下时预建连接。
+#[tauri::command]
+fn set_realtime_preconnect_hint(enabled: bool, vocabulary: Option<String>) {
+    REALTIME_PRECONNECT_HINT.store(enabled, Ordering::SeqCst);
+    if let Some(vocabulary) = vocabulary {
+        let compact = vocabulary
+            .split(['\n', ',', ';', '，', '；', '、'])
+            .map(str::trim)
+            .filter(|term| !term.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
+        if let Ok(mut stored) = REALTIME_VOCABULARY.lock() {
+            *stored = Some(compact.chars().take(400).collect());
+        }
+    }
+}
+
 #[cfg(windows)]
 fn tap_virtual_key(key: u8) {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
@@ -8892,6 +9062,7 @@ pub fn run() {
             replace_realtime_dictation_text,
             clear_dictation_focus_target,
             get_work_area,
+            set_realtime_preconnect_hint,
             is_alt_key_down,
             activate_assistant,
             hide_edge,

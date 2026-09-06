@@ -932,7 +932,8 @@ pub async fn optimize_dictation(
     let client = shared_http_client();
     let max_tokens = (source.chars().count().saturating_mul(2) + 48).clamp(96, 320);
     let candidate = tokio::time::timeout(
-        std::time::Duration::from_millis(3800),
+        // 润色是松开后的最后一步：2.5 秒内没返回就直接上原始转写，保证收尾跟手。
+        std::time::Duration::from_millis(2500),
         complete_dictation(&client, &provider, &key, &messages, max_tokens),
     )
     .await
