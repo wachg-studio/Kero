@@ -1284,6 +1284,8 @@ export function Capsule() {
 
   const requestDictationStop = useCallback(() => {
     if (!listeningRef.current || listeningMode.current !== "dictation") {
+      // 快速点按 Alt 时 stop 事件可能先于启动完成到达：置位请求，阻止尚未完成的 startListening 进入录音。
+      dictationStopRequested.current = true;
       stopListeningRef.current?.(true);
       return;
     }
@@ -1338,6 +1340,12 @@ export function Capsule() {
 
   const startListening = useCallback(async (mode: ListeningMode = "chat") => {
     if (isStreamingRef.current || listeningRef.current) return;
+    // Alt 已经在启动完成前松开（快速点按）：不进入录音，直接按托盘状态收尾隐藏。
+    if (mode === "dictation" && !dictationHeldRef.current) {
+      void invoke("clear_dictation_focus_target");
+      hideAfterTrayDictation();
+      return;
+    }
     dictationFlowId.current += 1;
     const flowId = dictationFlowId.current;
     transcriptRef.current = "";
@@ -1487,10 +1495,26 @@ export function Capsule() {
       }
       const stream = await streamPromise;
       microphoneStream = stream;
-      if (dictationFlowId.current !== flowId || !listeningRef.current || listeningMode.current !== mode || (useAiDictation && dictationStopRequested.current)) {
+      if (dictationFlowId.current !== flowId) {
+        // 已被更新的听写会话接管：只清理本会话的资源，不触碰当前状态。
         if (realtimeSession) void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
         realtimeDictationSessionId.current = null;
         stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      if (!listeningRef.current || listeningMode.current !== mode || (useAiDictation && dictationStopRequested.current)) {
+        // 启动过程中 Alt 已经松开（或麦克风失败）：完整复位并按托盘状态隐藏，避免卡在聆听状态。
+        if (realtimeSession) void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
+        realtimeDictationSessionId.current = null;
+        stream.getTracks().forEach((track) => track.stop());
+        listeningRef.current = false;
+        listeningMode.current = "chat";
+        setListening(false);
+        setIsDictating(false);
+        setDictationPhase("idle");
+        setDictationTranscript("");
+        void invoke("clear_dictation_focus_target");
+        hideAfterTrayDictation();
         return;
       }
       if (useAiDictation) {
@@ -1611,7 +1635,7 @@ export function Capsule() {
       }
       stopListening(false);
     }
-  }, [appearance.autoSend, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, beginEdge, closeContextMenu, emitEdge, finishAiDictation, requestDictationStop, stopListening]);
+  }, [appearance.autoSend, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, beginEdge, closeContextMenu, emitEdge, finishAiDictation, hideAfterTrayDictation, requestDictationStop, stopListening]);
 
   startListeningRef.current = startListening;
 

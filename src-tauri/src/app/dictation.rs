@@ -19,6 +19,9 @@ struct FocusTarget {
 
 #[cfg(windows)]
 static FOCUS_TARGET: OnceLock<Mutex<Option<FocusTarget>>> = OnceLock::new();
+// 一次听写会话内首次成功恢复焦点后置位：后续实时替换只做轻量校验，
+// 避免高频 AttachThreadInput + UIA 操作扰乱目标应用的键盘焦点状态。
+static FOCUS_RESTORE_PRIMED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(windows)]
 pub(crate) fn capture_focus_target() -> bool {
@@ -76,6 +79,7 @@ pub(crate) fn capture_focus_target() -> bool {
 
 #[cfg(windows)]
 pub(crate) fn clear_focus_target() {
+    FOCUS_RESTORE_PRIMED.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Ok(mut target) = FOCUS_TARGET.get_or_init(|| Mutex::new(None)).lock() {
         *target = None;
     }
@@ -272,6 +276,17 @@ fn is_dictation_punctuation(character: char) -> bool {
     )
 }
 
+fn is_cjk_char(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{ac00}'..='\u{d7af}'
+    )
+}
+
 /// 听写文本统一使用英文半角标点：ASR 和润色模型偶尔输出全角标点，写入前强制归一。
 pub(crate) fn normalize_dictation_punctuation(value: &str) -> String {
     let characters = value.chars().collect::<Vec<_>>();
@@ -297,6 +312,22 @@ pub(crate) fn normalize_dictation_punctuation(value: &str) -> String {
         }
         output.push(normalized);
     }
+    // 句子中间的句号（前后都是汉字）改写成逗号：正常打字不会在句中敲句号；
+    // 小数点和英文上下文（如 node.js）不受影响。
+    let mid_chars = output.chars().collect::<Vec<_>>();
+    let mut refined = String::with_capacity(output.len());
+    for (index, character) in mid_chars.iter().copied().enumerate() {
+        let mut character = character;
+        if character == '.' {
+            let previous = mid_chars[..index].iter().rev().copied().find(|c| !c.is_whitespace());
+            let next = mid_chars[index + 1..].iter().copied().find(|c| !c.is_whitespace());
+            if previous.is_some_and(is_cjk_char) && next.is_some_and(is_cjk_char) {
+                character = ',';
+            }
+        }
+        refined.push(character);
+    }
+    let mut output = refined;
     // 正常打字不会特意在末尾敲句号：剥掉结尾的句点（连同尾随空格，连续句点一并去掉）。
     while matches!(output.chars().last(), Some('.') | Some('。') | Some(' ')) {
         output.pop();
@@ -878,7 +909,8 @@ pub async fn optimize_dictation(
          {vocabulary_rule}\n\
          {memory_rule}\n\
          标点恢复是必须完成的核心任务：先理解整段话，再按语义关系断句。并列、转折、因果、条件、补充说明和话题切换处应使用合适的逗号、分号、冒号、问号或感叹号；不要把多个完整分句连成一整串，也不要机械地按停顿乱加标点。\n\
-         所有标点一律使用英文半角符号：逗号用 , 句号用 . 问号用 ? 感叹号用 ! 分号用 ; 冒号用 : 引号用 \" 和 ' 括号用 ( )；顿号也写成半角逗号。严禁输出全角标点（，。？！、；：“”‘’（））。\n\
+         除小数点、英文缩写和文件扩展名外，句子中间不要使用句号，需要分句时一律使用逗号。
+\n         所有标点一律使用英文半角符号：逗号用 , 句号用 . 问号用 ? 感叹号用 ! 分号用 ; 冒号用 : 引号用 \" 和 ' 括号用 ( )；顿号也写成半角逗号。严禁输出全角标点（，。？！、；：“”‘’（））。\n\
          删除无意义的‘嗯’‘啊’‘呃’‘那个’‘就是说’以及口吃和自我重复。仅在当前整理强度允许时改字、补词或调整语序；宁可保留略显口语的表达，也不能猜测用户没说过的内容。正确处理英文大小写和常见产品名。\n\
          数字、日期、数量、人名、地点、软件或文件名称、否定范围、可能性、时间先后、操作对象与方向、网址、文件路径和用户命令不可擅自改变。不得补充事实、替换对象、回答内容、总结或续写。\n\
          默认不要在整段末尾添加句号；明确的疑问句和感叹句应保留问号或感叹号。\n\
@@ -1057,6 +1089,12 @@ fn restore_focus_before_input() -> Result<(), String> {
             clear_focus_target();
             return Err("原输入框不再可用，未向 Kero 胶囊写入听写内容。".to_string());
         }
+        // 会话内已经成功恢复过一次焦点：前台窗口未变时直接复用，跳过重量级恢复流程。
+        if FOCUS_RESTORE_PRIMED.load(std::sync::atomic::Ordering::SeqCst)
+            && GetForegroundWindow() == foreground
+        {
+            return Ok(());
+        }
         let attached = current_thread != target_thread
             && target_thread != 0
             && AttachThreadInput(current_thread, target_thread, 1) != 0;
@@ -1101,6 +1139,7 @@ fn restore_focus_before_input() -> Result<(), String> {
             "dictation target ready process_id={} native_focus={} semantic_focus={}",
             target.process_id, native_focus_restored, semantic_focus_restored
         ));
+        FOCUS_RESTORE_PRIMED.store(true, std::sync::atomic::Ordering::SeqCst);
     }
     Ok(())
 }
