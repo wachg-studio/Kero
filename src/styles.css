@@ -302,7 +302,7 @@ html, body, #root { background: rgba(255, 255, 255, 0) !important; background-co
 .voice-wave.is-processing { color: #0966e8; }.voice-wave.is-processing i { animation: kero-processing-wave .82s ease-in-out infinite; }.voice-wave.is-processing i:nth-child(2) { animation-delay: .09s; }.voice-wave.is-processing i:nth-child(3) { animation-delay: .18s; }.voice-wave.is-processing i:nth-child(4) { animation-delay: .27s; }.voice-wave.is-processing i:nth-child(5) { animation-delay: .36s; }
 .voice-disc:disabled { opacity: .42; cursor: default; }
 
-/* 千问式细长听写条：单行纯黑胶囊，屏幕底部居中，两端 ×/✓，中间实时声波或转写文字；无投影 */
+/* 灵动听写条：单行纯黑胶囊，屏幕底部居中，两端 ×/✓，中间实时声波或转写文字；无投影 */
 .reference-capsule.is-dictation-pill {
   border-color: rgba(255, 255, 255, .06);
   border-radius: 24px;

@@ -55,7 +55,7 @@ type RealtimeDictationEvent = {
 
 type DictationPhase = "idle" | "listening" | "finishing" | "recognizing" | "polishing" | "inserting" | "error";
 
-// 千问式细长听写条：单行高度，文字从中间向两侧拉长，宽度封顶后内部横向滚动。
+// 灵动听写条：单行高度，文字从中间向两侧拉长，宽度封顶后内部横向滚动。
 const dictationPillHeight = 48;
 const dictationPillMinWidth = 168;
 const dictationPillMaxWidth = 720;
@@ -1325,7 +1325,7 @@ export function Capsule() {
     }
   }, [clearRealtimeReplaceTimer, finishRealtimeAiDictation]);
 
-  // 千问式 ✓：聆听中点击等于松开 Alt（收尾→润色→写入）；出错时点击重试写入。
+  // 听写条确认按钮：聆听中点击等于松开 Alt（收尾→润色→写入）；出错时点击重试写入。
   const confirmDictation = useCallback(() => {
     if (dictationPhase === "error") {
       retryDictationInsert();
@@ -1914,7 +1914,7 @@ export function Capsule() {
 
   useEffect(() => {
     if (dictationPanel) {
-      // 千问式听写条：直接出现在屏幕底部、任务栏上方、水平居中，不做从胶囊形变过来的动画。
+      // 听写条：直接出现在屏幕底部、任务栏上方、水平居中，不做从胶囊形变过来的动画。
       let cancelled = false;
       void (async () => {
         const win = getCurrentWindow();
