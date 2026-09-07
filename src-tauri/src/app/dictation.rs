@@ -1027,7 +1027,7 @@ mod tests {
     fn normalizes_ascii_punctuation_in_chinese_context() {
         assert_eq!(
             clean_dictation_layout("你看一下,这个为什么不行?真的很奇怪!"),
-            "你看一下，这个为什么不行？真的很奇怪！"
+            "你看一下,这个为什么不行?真的很奇怪!"
         );
         assert_eq!(
             clean_dictation_layout("Gemini 3.7 Flash"),
@@ -1257,6 +1257,76 @@ fn send_backspaces(count: usize) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+#[cfg(windows)]
+fn read_unicode_clipboard() -> Result<Option<String>, String> {
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
+    use windows_sys::Win32::System::Memory::GlobalLock;
+    const CF_UNICODETEXT: u32 = 13;
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("无法读取剪贴板".to_string());
+        }
+        let handle: HANDLE = GetClipboardData(CF_UNICODETEXT);
+        if handle.is_null() {
+            CloseClipboard();
+            return Ok(None);
+        }
+        let pointer = GlobalLock(handle) as *const u16;
+        if pointer.is_null() {
+            CloseClipboard();
+            return Err("无法读取剪贴板文本".to_string());
+        }
+        let mut length = 0usize;
+        while *pointer.add(length) != 0 {
+            length += 1;
+        }
+        let text = String::from_utf16_lossy(std::slice::from_raw_parts(pointer, length));
+        CloseClipboard();
+        Ok(Some(text))
+    }
+}
+
+#[cfg(windows)]
+fn send_copy_shortcut() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{keybd_event, KEYEVENTF_KEYUP};
+    unsafe {
+        keybd_event(0x11, 0, 0, 0);
+        keybd_event(0x43, 0, 0, 0);
+        keybd_event(0x43, 0, KEYEVENTF_KEYUP, 0);
+        keybd_event(0x11, 0, KEYEVENTF_KEYUP, 0);
+    }
+}
+
+/// 读取当前外部输入框的选区文本。复制完成后恢复焦点，但不改变选区本身。
+pub fn selected_text_from_active() -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        restore_focus_before_input()?;
+        send_copy_shortcut();
+        std::thread::sleep(std::time::Duration::from_millis(90));
+        let text = read_unicode_clipboard()?.unwrap_or_default();
+        if text.trim().is_empty() {
+            return Err("没有选中可翻译的文本".to_string());
+        }
+        return Ok(text);
+    }
+    #[cfg(not(windows))]
+    Err("选区翻译目前仅支持 Windows".to_string())
+}
+
+/// 在已恢复的目标输入框中直接覆盖仍处于选中状态的文字。
+pub fn replace_selected_text(text: String) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let result = restore_focus_before_input().and_then(|_| send_unicode_text(&normalize_dictation_punctuation(&text)));
+        clear_focus_target();
+        return result;
+    }
+    #[cfg(not(windows))]
+    Err("选区翻译目前仅支持 Windows".to_string())
+}
+
 fn insert_text_to_active_impl(text: &str) -> Result<(), String> {
     let result = restore_focus_before_input().and_then(|_| send_unicode_text(&normalize_dictation_punctuation(text)));
     clear_focus_target();

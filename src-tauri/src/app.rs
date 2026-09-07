@@ -35,6 +35,10 @@ use dictation::capture_focus_target;
 static CLICK_THROUGH: AtomicBool = AtomicBool::new(false);
 static ESCAPE_HELD: AtomicBool = AtomicBool::new(false);
 static ALT_HELD: AtomicBool = AtomicBool::new(false);
+static CTRL_HELD: AtomicBool = AtomicBool::new(false);
+static E_HELD: AtomicBool = AtomicBool::new(false);
+static ALT_DICTATION_ENGLISH: AtomicBool = AtomicBool::new(false);
+static CTRL_EF_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 // A bare Alt release activates the foreground app's menu bar on Windows. When
 // Alt starts an external dictation session, consume that whole key cycle.
 static ALT_DICTATION_SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -69,9 +73,12 @@ enum RealtimeDictationCommand {
 struct PreconnectedRealtime {
     socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     created_at: std::time::Instant,
+    fingerprint: String,
 }
 
 static REALTIME_PRECONNECT: std::sync::Mutex<Option<PreconnectedRealtime>> = std::sync::Mutex::new(None);
+static REALTIME_PRECONNECT_GENERATION: AtomicU64 = AtomicU64::new(0);
+static REALTIME_PRECONNECT_CONNECTING: AtomicBool = AtomicBool::new(false);
 // 前端告知当前是否使用流式识别模型；避免非流式用户每次按 Alt 都白建一条连接。
 static REALTIME_PRECONNECT_HINT: AtomicBool = AtomicBool::new(false);
 static REALTIME_VOCABULARY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -82,6 +89,23 @@ fn realtime_preconnect_vocabulary() -> Option<String> {
         .ok()
         .and_then(|value| value.clone())
         .filter(|value| !value.trim().is_empty())
+}
+
+fn realtime_preconnect_fingerprint(
+    origin: &str,
+    model: &str,
+    sample_rate: u32,
+    vocabulary: Option<&str>,
+) -> String {
+    format!("{origin}|{}|{sample_rate}|{}", model.trim().to_ascii_lowercase(), vocabulary.unwrap_or_default())
+}
+
+fn invalidate_realtime_preconnect() {
+    REALTIME_PRECONNECT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    REALTIME_PRECONNECT_CONNECTING.store(false, Ordering::SeqCst);
+    if let Ok(mut pool) = REALTIME_PRECONNECT.lock() {
+        *pool = None;
+    }
 }
 
 /// 把底层连接/接口错误翻译成用户能采取行动的提示。
@@ -186,35 +210,55 @@ async fn qwen_realtime_handshake(
     }
 }
 
+async fn reconnect_qwen_realtime_socket(
+    origin: &str,
+    model: &str,
+    key: &str,
+    sample_rate: u32,
+    context: Option<&str>,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, String> {
+    let mut socket = connect_qwen_realtime_socket(origin, model, key).await?;
+    qwen_realtime_handshake(&mut socket, sample_rate, context, 5).await?;
+    Ok(socket)
+}
+
 /// Alt 按下时后台预连接：只对已启用流式模型的用户生效，任何失败都静默忽略。
 async fn preconnect_realtime_dictation() {
-    if !REALTIME_PRECONNECT_HINT.load(Ordering::SeqCst) {
+    if !REALTIME_PRECONNECT_HINT.load(Ordering::SeqCst)
+        || REALTIME_PRECONNECT_CONNECTING.swap(true, Ordering::SeqCst)
+    {
         return;
     }
-    if REALTIME_PRECONNECT.lock().ok().map(|pool| pool.is_some()).unwrap_or(true) {
-        return;
+    let generation = REALTIME_PRECONNECT_GENERATION.load(Ordering::SeqCst);
+    let result = async {
+        if REALTIME_PRECONNECT.lock().ok().map(|pool| pool.is_some()).unwrap_or(true) {
+            return None;
+        }
+        let Ok(app_config) = load_config() else { return None };
+        let config = app_config.dictation_asr;
+        if !is_qwen3_asr_realtime_model(&config.model) {
+            return None;
+        }
+        let Some(origin) = dashscope_realtime_asr_origin(config.base_url.trim_end_matches('/')) else {
+            return None;
+        };
+        let sample_rate = if config.model.to_ascii_lowercase().contains("8k") { 8_000 } else { 16_000 };
+        let key = match read_secret(DICTATION_ASR_SECRET_ID) {
+            Ok(Some(key)) if !key.trim().is_empty() => key,
+            _ => return None,
+        };
+        let context = realtime_preconnect_vocabulary();
+        let fingerprint = realtime_preconnect_fingerprint(origin, &config.model, sample_rate, context.as_deref());
+        let mut socket = connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await.ok()?;
+        qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 5).await.ok()?;
+        Some((socket, fingerprint))
     }
-    let Ok(app_config) = load_config() else { return };
-    let config = app_config.dictation_asr;
-    if !is_qwen3_asr_realtime_model(&config.model) {
-        return;
-    }
-    let Some(origin) = dashscope_realtime_asr_origin(config.base_url.trim_end_matches('/')) else {
-        return;
-    };
-    let sample_rate = if config.model.to_ascii_lowercase().contains("8k") { 8_000 } else { 16_000 };
-    let key = match read_secret(DICTATION_ASR_SECRET_ID) {
-        Ok(Some(key)) if !key.trim().is_empty() => key,
-        _ => return,
-    };
-    let mut socket = match connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await {
-        Ok(socket) => socket,
-        Err(_) => return,
-    };
-    let context = realtime_preconnect_vocabulary();
-    if qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 5)
-        .await
-        .is_err()
+    .await;
+    REALTIME_PRECONNECT_CONNECTING.store(false, Ordering::SeqCst);
+    let Some((socket, fingerprint)) = result else { return };
+    // 配置变更或正式会话已抢先启动时，丢弃这个过期预连接。
+    if generation != REALTIME_PRECONNECT_GENERATION.load(Ordering::SeqCst)
+        || !REALTIME_PRECONNECT_HINT.load(Ordering::SeqCst)
     {
         return;
     }
@@ -222,16 +266,20 @@ async fn preconnect_realtime_dictation() {
         Ok(pool) => pool,
         Err(_) => return,
     };
-    if pool.is_some() {
+    if pool.is_some() || generation != REALTIME_PRECONNECT_GENERATION.load(Ordering::SeqCst) {
         return;
     }
     *pool = Some(PreconnectedRealtime {
         socket,
         created_at: std::time::Instant::now(),
+        fingerprint,
     });
     // 8 秒内未被认领则丢弃，避免长期挂着的空闲连接。
-    std::thread::spawn(|| {
+    std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(8));
+        if generation != REALTIME_PRECONNECT_GENERATION.load(Ordering::SeqCst) {
+            return;
+        }
         if let Ok(mut pool) = REALTIME_PRECONNECT.lock() {
             if let Some(preconnected) = pool.as_ref() {
                 if preconnected.created_at.elapsed() >= std::time::Duration::from_secs(8) {
@@ -243,7 +291,7 @@ async fn preconnect_realtime_dictation() {
 }
 
 struct RealtimeDictationSession {
-    sender: tokio::sync::mpsc::UnboundedSender<RealtimeDictationCommand>,
+    sender: tokio::sync::mpsc::Sender<RealtimeDictationCommand>,
 }
 
 #[derive(Serialize)]
@@ -487,21 +535,67 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: usize, data: isize) 
             let is_injected = hook.flags & 0x10 != 0;
             let is_pressed = message as u32 == WM_KEYDOWN || message as u32 == WM_SYSKEYDOWN;
             let is_released = message as u32 == WM_KEYUP || message as u32 == WM_SYSKEYUP;
+            if (key == 0x11 || key == 0xa2 || key == 0xa3) && !is_injected {
+                CTRL_HELD.store(is_pressed && !is_released, Ordering::SeqCst);
+                if is_released && CTRL_EF_SUPPRESSED.swap(false, Ordering::SeqCst) {
+                    return true;
+                }
+            }
+            if key == 0x46 && !is_injected && is_pressed && CTRL_HELD.load(Ordering::SeqCst) && E_HELD.load(Ordering::SeqCst) {
+                // Ctrl+E+F：捕获当前外部输入框的选区，前端随后流式翻译并覆盖选区。
+                let captured = capture_focus_target();
+                CTRL_EF_SUPPRESSED.store(captured, Ordering::SeqCst);
+                if captured {
+                    if let Some(app) = HOTKEY_APP.get() {
+                        let _ = app.emit_to("main", "kero:shortcut-selection-translate", ());
+                    }
+                }
+                return captured;
+            }
+            if key == 0x45 && !is_injected {
+                // 记录 E 的物理按下状态，使 E→Alt 和 Alt→E 两种顺序都能进入英译听写。
+                E_HELD.store(is_pressed && !is_released, Ordering::SeqCst);
+                if is_pressed && ALT_HELD.load(Ordering::SeqCst) && !CTRL_HELD.load(Ordering::SeqCst) {
+                    // Alt+E：在当前听写会话内升级为松开后英译；吞掉 E，避免它落入目标输入框。
+                    ALT_DICTATION_ENGLISH.store(true, Ordering::SeqCst);
+                    if let Some(app) = HOTKEY_APP.get() {
+                        let _ = app.emit_to("main", "kero:shortcut-dictation-mode", json!({ "translateToEnglish": true }));
+                    }
+                    return true;
+                }
+                if CTRL_HELD.load(Ordering::SeqCst) && !ALT_HELD.load(Ordering::SeqCst) {
+                    // Ctrl+E 是选区翻译的前缀，阻止其单独触发目标应用的 Ctrl+E 行为。
+                    return true;
+                }
+                if is_released {
+                    return ALT_DICTATION_SUPPRESSED.load(Ordering::SeqCst);
+                }
+            }
             if (key == 0x12 || key == 0xa4 || key == 0xa5) && !is_injected {
                 if is_pressed && !ALT_HELD.swap(true, Ordering::SeqCst) {
                     let captured_external_target = capture_focus_target();
                     ALT_DICTATION_SUPPRESSED.store(captured_external_target, Ordering::SeqCst);
+                    let translate_to_english = E_HELD.load(Ordering::SeqCst);
+                    ALT_DICTATION_ENGLISH.store(translate_to_english, Ordering::SeqCst);
                     DICTATION_ACTIVE.store(captured_external_target, Ordering::SeqCst);
                     tauri::async_runtime::spawn(async {
                         let _ = warm_dictation_service_inner().await;
                     });
                     tauri::async_runtime::spawn(preconnect_realtime_dictation());
                     if let Some(app) = HOTKEY_APP.get() {
-                        let _ = app.emit_to("main", "kero:shortcut-dictation-start", ());
+                        let _ = app.emit_to(
+                            "main",
+                            "kero:shortcut-dictation-start",
+                            json!({ "translateToEnglish": translate_to_english }),
+                        );
                     }
                 } else if is_released && ALT_HELD.swap(false, Ordering::SeqCst) {
                     if let Some(app) = HOTKEY_APP.get() {
-                        let _ = app.emit_to("main", "kero:shortcut-dictation-stop", ());
+                        let _ = app.emit_to(
+                            "main",
+                            "kero:shortcut-dictation-stop",
+                            json!({ "translateToEnglish": ALT_DICTATION_ENGLISH.swap(false, Ordering::SeqCst) }),
+                        );
                     }
                     return ALT_DICTATION_SUPPRESSED.swap(false, Ordering::SeqCst);
                 }
@@ -869,6 +963,20 @@ struct ChatAttachment {
     name: String,
     mime_type: String,
     data_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationTransformRequest {
+    text: String,
+    #[serde(default)]
+    target_language: Option<String>,
+    #[serde(default)]
+    correct_typos: Option<bool>,
+    #[serde(default)]
+    vocabulary: Option<String>,
+    #[serde(default)]
+    memory: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1785,6 +1893,37 @@ mod tests {
         );
         assert_eq!(parse_computer_control_intent("无法判断"), None);
     }
+
+    #[test]
+    fn qwen_transcript_deduplicates_replayed_completed_segments() {
+        let mut transcript = RealtimeDictationTranscript::new();
+        transcript.commit_segment("你好, ");
+        transcript.commit_segment("你好, ");
+        transcript.commit_segment("今天很好");
+        assert_eq!(transcript.full_text(), "你好,今天很好");
+    }
+
+    #[test]
+    fn qwen_transcript_merges_segment_boundary_overlap() {
+        let mut transcript = RealtimeDictationTranscript::new();
+        transcript.commit_segment("部署 Kero, ");
+        transcript.commit_segment("Kero, 然后重启");
+        assert_eq!(transcript.full_text(), "部署 Kero, 然后重启");
+    }
+
+    #[test]
+    fn realtime_preconnect_fingerprint_changes_with_context() {
+        let baseline = realtime_preconnect_fingerprint("wss://example.test", "qwen3-asr-flash-realtime", 16_000, Some("Kero"));
+        assert_ne!(baseline, realtime_preconnect_fingerprint("wss://example.test", "qwen3-asr-flash-realtime", 16_000, Some("Codex")));
+        assert_ne!(baseline, realtime_preconnect_fingerprint("wss://example.test", "other-model", 16_000, Some("Kero")));
+    }
+
+    #[test]
+    fn realtime_error_messages_are_actionable() {
+        assert!(friendly_realtime_error("401 Unauthorized").contains("API Key"));
+        assert!(friendly_realtime_error("rate limit exceeded").contains("额度"));
+        assert!(friendly_realtime_error("connection timeout").contains("超时"));
+    }
 }
 
 fn secret_entry(provider_id: &str) -> Result<Entry, String> {
@@ -1905,6 +2044,7 @@ fn save_dictation_asr_config(
         model: model.to_string(),
     };
     save_config(&app_config)?;
+    invalidate_realtime_preconnect();
     Ok(public_dictation_asr_config(&app_config.dictation_asr))
 }
 
@@ -2176,6 +2316,24 @@ impl RealtimeDictationTranscript {
     fn full_text(&self) -> String {
         format!("{}{}", self.committed, self.current)
     }
+
+    /// Qwen 在重连或网络抖动后可能重复发送已完成分句；追加时去掉精确重复和边界重叠。
+    fn commit_segment(&mut self, segment: &str) {
+        let segment = segment.trim();
+        if segment.is_empty() || self.committed.ends_with(segment) {
+            self.current.clear();
+            return;
+        }
+        let committed = self.committed.chars().collect::<Vec<_>>();
+        let incoming = segment.chars().collect::<Vec<_>>();
+        let max_overlap = committed.len().min(incoming.len());
+        let overlap = (1..=max_overlap)
+            .rev()
+            .find(|length| committed[committed.len() - *length..] == incoming[..*length])
+            .unwrap_or(0);
+        self.committed.extend(incoming[overlap..].iter());
+        self.current.clear();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2204,13 +2362,141 @@ fn is_qwen3_asr_realtime_model(model: &str) -> bool {
     dictation_realtime_protocol(model) == RealtimeDictationProtocol::QwenRealtime
 }
 
+async fn run_qwen_realtime_dictation(
+    mut socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    mut receiver: tokio::sync::mpsc::Receiver<RealtimeDictationCommand>,
+    app: AppHandle,
+    session_id: String,
+    origin: String,
+    model: String,
+    key: String,
+    sample_rate: u32,
+    context: Option<String>,
+) {
+    let mut transcript = RealtimeDictationTranscript::new();
+    let mut finishing = false;
+    let mut reconnect_attempted = false;
+    let terminal = |message: String, transcript: &RealtimeDictationTranscript| {
+        emit_realtime_dictation_event(&app, &session_id, None, Some(&transcript.full_text()), true, Some(&message));
+    };
+    loop {
+        tokio::select! {
+            command = receiver.recv(), if !finishing => match command {
+                Some(RealtimeDictationCommand::Audio(frame)) => {
+                    let payload = json!({
+                        "type": "input_audio_buffer.append",
+                        "audio": BASE64.encode(&frame),
+                    }).to_string();
+                    if let Err(error) = socket.send(Message::Text(payload.clone().into())).await {
+                        // 只恢复一次，且只回放这一帧（约 100ms）明确未发送成功的 PCM；
+                        // 已成功 send 的历史音频绝不重放，避免网络抖动造成重复转写。
+                        if !reconnect_attempted {
+                            reconnect_attempted = true;
+                            match reconnect_qwen_realtime_socket(&origin, &model, &key, sample_rate, context.as_deref()).await {
+                                Ok(mut recovered) => match recovered.send(Message::Text(payload.into())).await {
+                                    Ok(()) => { socket = recovered; continue; }
+                                    Err(retry_error) => terminal(format!("实时语音识别重连后无法发送录音: {retry_error}"), &transcript),
+                                },
+                                Err(retry_error) => terminal(format!("实时语音识别重连失败: {retry_error}"), &transcript),
+                            }
+                        } else {
+                            terminal(format!("无法发送实时录音: {error}"), &transcript);
+                        }
+                        break;
+                    }
+                }
+                Some(RealtimeDictationCommand::Finish) | None => {
+                    finishing = true;
+                    if let Err(error) = socket.send(Message::Text(json!({ "type": "session.finish" }).to_string().into())).await {
+                        terminal(format!("无法结束实时语音识别: {error}"), &transcript);
+                        break;
+                    }
+                }
+            },
+            message = socket.next() => match message {
+                Some(Ok(Message::Text(message))) => {
+                    let Ok(value) = serde_json::from_str::<Value>(&message) else { continue; };
+                    let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
+                    match event {
+                        "conversation.item.input_audio_transcription.text" => {
+                            let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
+                            let stash = value.get("stash").and_then(Value::as_str).unwrap_or_default();
+                            let preview = format!("{text}{stash}");
+                            let preview = preview.trim();
+                            if !preview.is_empty() {
+                                transcript.current = preview.to_string();
+                                let full = transcript.full_text();
+                                emit_realtime_dictation_event(&app, &session_id, Some(preview), Some(&full), false, None);
+                            }
+                        }
+                        "conversation.item.input_audio_transcription.completed" => {
+                            if let Some(segment) = value.get("transcript").and_then(Value::as_str) {
+                                let segment = segment.trim();
+                                if !segment.is_empty() {
+                                    transcript.commit_segment(segment);
+                                    let full = transcript.full_text();
+                                    emit_realtime_dictation_event(&app, &session_id, Some(segment), Some(&full), false, None);
+                                }
+                            }
+                        }
+                        "conversation.item.input_audio_transcription.failed" | "error" => {
+                            let message = value.pointer("/error/message")
+                                .and_then(Value::as_str)
+                                .or_else(|| value.get("message").and_then(Value::as_str))
+                                .unwrap_or("实时语音识别转写失败");
+                            terminal(friendly_realtime_error(message), &transcript);
+                            break;
+                        }
+                        "session.finished" => {
+                            let full = transcript.full_text();
+                            emit_realtime_dictation_event(&app, &session_id, None, Some(&full), true, None);
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(Ok(Message::Ping(payload))) => { let _ = socket.send(Message::Pong(payload)).await; }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    let reason = format!("读取实时语音识别结果失败: {error}");
+                    if !finishing && !reconnect_attempted {
+                        reconnect_attempted = true;
+                        match reconnect_qwen_realtime_socket(&origin, &model, &key, sample_rate, context.as_deref()).await {
+                            Ok(recovered) => { socket = recovered; continue; }
+                            Err(reconnect_error) => terminal(format!("实时语音识别重连失败: {reconnect_error}"), &transcript),
+                        }
+                    } else {
+                        terminal(reason, &transcript);
+                    }
+                    break;
+                }
+                None => {
+                    let reason = "实时语音识别服务已断开".to_string();
+                    if !finishing && !reconnect_attempted {
+                        reconnect_attempted = true;
+                        match reconnect_qwen_realtime_socket(&origin, &model, &key, sample_rate, context.as_deref()).await {
+                            Ok(recovered) => { socket = recovered; continue; }
+                            Err(reconnect_error) => terminal(format!("实时语音识别重连失败: {reconnect_error}"), &transcript),
+                        }
+                    } else {
+                        terminal(reason, &transcript);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+    realtime_dictation_sessions().lock().unwrap().remove(&session_id);
+}
+
 fn register_realtime_dictation_session(
 ) -> (
     String,
-    tokio::sync::mpsc::UnboundedReceiver<RealtimeDictationCommand>,
+    tokio::sync::mpsc::Receiver<RealtimeDictationCommand>,
 ) {
     let session_id = Uuid::new_v4().to_string();
-    let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+    // 100ms PCM 一帧，容量 40 即最多约 4 秒缓存：网络异常时内存有确定上限。
+    let (sender, receiver) = tokio::sync::mpsc::channel(40);
     realtime_dictation_sessions()
         .lock()
         .unwrap()
@@ -2254,11 +2540,13 @@ async fn start_realtime_dictation(
             }
         }
         let context = realtime_preconnect_vocabulary();
-        // 认领 Alt 按下时预建的连接（6 秒内有效），没有预连接时现场建连。
-        let mut socket = match REALTIME_PRECONNECT.lock() {
+        let fingerprint = realtime_preconnect_fingerprint(origin, &config.model, sample_rate, context.as_deref());
+        // 认领 Alt 按下时预建的已握手连接（6 秒内且配置完全一致）；没有则现场建连并握手。
+        let preconnected = match REALTIME_PRECONNECT.lock() {
             Ok(mut pool) => match pool.take() {
                 Some(preconnected)
-                    if preconnected.created_at.elapsed() <= std::time::Duration::from_secs(6) =>
+                    if preconnected.created_at.elapsed() <= std::time::Duration::from_secs(6)
+                        && preconnected.fingerprint == fingerprint =>
                 {
                     Some(preconnected.socket)
                 }
@@ -2266,114 +2554,34 @@ async fn start_realtime_dictation(
             },
             Err(_) => None,
         };
-        if socket.is_none() {
-            socket = Some(connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await?);
-        }
-        let mut socket = socket.unwrap();
-        qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 8).await?;
+        // 正式会话开始后，后台预连接若晚到也不得再进入池。
+        REALTIME_PRECONNECT_GENERATION.fetch_add(1, Ordering::SeqCst);
+        let socket = match preconnected {
+            Some(socket) => socket,
+            None => {
+                let mut socket = connect_qwen_realtime_socket(origin, config.model.trim(), key.trim()).await?;
+                qwen_realtime_handshake(&mut socket, sample_rate, context.as_deref(), 8).await?;
+                socket
+            }
+        };
 
-        let (session_id, mut receiver) = register_realtime_dictation_session();
+        let (session_id, receiver) = register_realtime_dictation_session();
         let background_app = app.clone();
         let background_session_id = session_id.clone();
-        tauri::async_runtime::spawn(async move {
-            let (mut writer, mut reader) = socket.split();
-            let mut transcript = RealtimeDictationTranscript::new();
-            let mut finishing = false;
-            loop {
-                tokio::select! {
-                    command = receiver.recv(), if !finishing => match command {
-                        Some(RealtimeDictationCommand::Audio(frame)) => {
-                            let payload = json!({
-                                "type": "input_audio_buffer.append",
-                                "audio": BASE64.encode(&frame),
-                            })
-                            .to_string();
-                            if let Err(error) = writer.send(Message::Text(payload.into())).await {
-                                transcript.current.clear();
-                                emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法发送实时录音: {error}")));
-                                break;
-                            }
-                        }
-                        Some(RealtimeDictationCommand::Finish) | None => {
-                            finishing = true;
-                            if let Err(error) = writer.send(Message::Text(json!({ "type": "session.finish" }).to_string().into())).await {
-                                emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("无法结束实时语音识别: {error}")));
-                                break;
-                            }
-                        }
-                    },
-                    message = reader.next() => match message {
-                        Some(Ok(Message::Text(message))) => {
-                            let Ok(value) = serde_json::from_str::<Value>(&message) else {
-                                continue;
-                            };
-                            let event = value.get("type").and_then(Value::as_str).unwrap_or_default();
-                            match event {
-                                "conversation.item.input_audio_transcription.text" => {
-                                    let text = value.get("text").and_then(Value::as_str).unwrap_or_default();
-                                    let stash = value.get("stash").and_then(Value::as_str).unwrap_or_default();
-                                    let preview = format!("{text}{stash}");
-                                    let preview = preview.trim();
-                                    if !preview.is_empty() {
-                                        transcript.current = preview.to_string();
-                                        let full = transcript.full_text();
-                                        emit_realtime_dictation_event(&background_app, &background_session_id, Some(preview), Some(&full), false, None);
-                                    }
-                                }
-                                "conversation.item.input_audio_transcription.completed" => {
-                                    if let Some(segment) = value.get("transcript").and_then(Value::as_str) {
-                                        let segment = segment.trim();
-                                        if !segment.is_empty() {
-                                            transcript.committed.push_str(segment);
-                                            transcript.current.clear();
-                                            let full = transcript.full_text();
-                                            emit_realtime_dictation_event(&background_app, &background_session_id, Some(segment), Some(&full), false, None);
-                                        }
-                                    }
-                                }
-                                "conversation.item.input_audio_transcription.failed" => {
-                                    let message = value
-                                        .pointer("/error/message")
-                                        .and_then(Value::as_str)
-                                        .or_else(|| value.get("message").and_then(Value::as_str))
-                                        .unwrap_or("实时语音识别转写失败");
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(message));
-                                    break;
-                                }
-                                "error" => {
-                                    let message = value
-                                        .pointer("/error/message")
-                                        .and_then(Value::as_str)
-                                        .unwrap_or("实时语音识别出现错误");
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(message));
-                                    break;
-                                }
-                                "session.finished" => {
-                                    let full = transcript.full_text();
-                                    emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&full), true, None);
-                                    break;
-                                }
-                                _ => {}
-                            }
-                        }
-                        Some(Ok(Message::Ping(payload))) => { let _ = writer.send(Message::Pong(payload)).await; }
-                        Some(Ok(_)) => {}
-                        Some(Err(error)) => {
-                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some(&format!("读取实时语音识别结果失败: {error}")));
-                            break;
-                        }
-                        None => {
-                            emit_realtime_dictation_event(&background_app, &background_session_id, None, Some(&transcript.full_text()), true, Some("实时语音识别服务已断开"));
-                            break;
-                        }
-                    }
-                }
-            }
-            realtime_dictation_sessions()
-                .lock()
-                .unwrap()
-                .remove(&background_session_id);
-        });
+        let reconnect_origin = origin.to_string();
+        let reconnect_model = config.model.clone();
+        let reconnect_key = key.clone();
+        tauri::async_runtime::spawn(run_qwen_realtime_dictation(
+            socket,
+            receiver,
+            background_app,
+            background_session_id,
+            reconnect_origin,
+            reconnect_model,
+            reconnect_key,
+            sample_rate,
+            context,
+        ));
         return Ok(RealtimeDictationSessionStart {
             session_id,
             sample_rate,
@@ -2537,9 +2745,12 @@ fn push_realtime_dictation_audio(session_id: String, pcm_base64: String) -> Resu
         .get(&session_id)
         .map(|session| session.sender.clone())
         .ok_or_else(|| "实时语音识别会话已结束".to_string())?;
-    sender
-        .send(RealtimeDictationCommand::Audio(frame))
-        .map_err(|_| "实时语音识别会话已结束".to_string())
+    match sender.try_send(RealtimeDictationCommand::Audio(frame)) {
+        Ok(()) => Ok(()),
+        // 网络短暂拥塞时丢弃过期音频帧：保留实时性与固定内存上限，不让 IPC 队列无限增长。
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err("实时语音识别会话已结束".to_string()),
+    }
 }
 
 #[tauri::command]
@@ -2551,7 +2762,7 @@ fn finish_realtime_dictation(session_id: String) -> Result<(), String> {
         .map(|session| session.sender.clone())
         .ok_or_else(|| "实时语音识别会话已结束".to_string())?;
     sender
-        .send(RealtimeDictationCommand::Finish)
+        .try_send(RealtimeDictationCommand::Finish)
         .map_err(|_| "实时语音识别会话已结束".to_string())
 }
 
@@ -7532,6 +7743,16 @@ done: {"action":"done","message":"任务完成说明"}
 }
 
 #[tauri::command]
+fn selected_text_from_active() -> Result<String, String> {
+    dictation::selected_text_from_active()
+}
+
+#[tauri::command]
+fn replace_selected_text(text: String) -> Result<(), String> {
+    dictation::replace_selected_text(text)
+}
+
+#[tauri::command]
 fn insert_text_to_active(text: String) -> Result<(), String> {
     dictation::insert_text_to_active(text)
 }
@@ -7586,7 +7807,8 @@ fn get_work_area() -> Result<WorkArea, String> {
 /// 前端在模式/模型变化时同步：只有确认使用流式模型才允许 Alt 按下时预建连接。
 #[tauri::command]
 fn set_realtime_preconnect_hint(enabled: bool, vocabulary: Option<String>) {
-    REALTIME_PRECONNECT_HINT.store(enabled, Ordering::SeqCst);
+    let previous_enabled = REALTIME_PRECONNECT_HINT.swap(enabled, Ordering::SeqCst);
+    let previous_vocabulary = realtime_preconnect_vocabulary();
     if let Some(vocabulary) = vocabulary {
         let compact = vocabulary
             .split(['\n', ',', ';', '，', '；', '、'])
@@ -7597,6 +7819,9 @@ fn set_realtime_preconnect_hint(enabled: bool, vocabulary: Option<String>) {
         if let Ok(mut stored) = REALTIME_VOCABULARY.lock() {
             *stored = Some(compact.chars().take(400).collect());
         }
+    }
+    if previous_enabled != enabled || previous_vocabulary != realtime_preconnect_vocabulary() {
+        invalidate_realtime_preconnect();
     }
 }
 
@@ -8474,6 +8699,82 @@ async fn computer_execute_action(
 }
 
 #[tauri::command]
+async fn stream_dictation_transform(
+    app: AppHandle,
+    request_id: String,
+    request: DictationTransformRequest,
+) -> Result<(), String> {
+    let source = dictation::normalize_dictation_punctuation(request.text.trim());
+    if source.is_empty() {
+        emit_stream_event(&app, &request_id, None, true, Some("没有可整理的听写内容".to_string()));
+        return Ok(());
+    }
+    if source.chars().count() > 4_000 {
+        emit_stream_event(&app, &request_id, None, true, Some("单次听写内容不能超过 4000 个字符".to_string()));
+        return Ok(());
+    }
+    let translate_to_english = request.target_language.as_deref() == Some("en");
+    let vocabulary = request
+        .vocabulary
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .take(32)
+        .collect::<Vec<_>>()
+        .join("; ");
+    let memory = request
+        .memory
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let instruction = if translate_to_english {
+        format!(
+            "You are a precise Chinese voice-input translator. Translate the user's Chinese into natural, concise English. Return only the English text with no explanation, title, quotes, Markdown, or trailing period. Preserve names, numbers, URLs, paths, commands, constraints, negation, and intent exactly. Use English half-width punctuation. Context terms: {vocabulary}."
+        )
+    } else {
+        let correction = if request.correct_typos.unwrap_or(true) {
+            "Restore punctuation, fix only high-confidence ASR homophones, typos, product names, and adjacent stutters."
+        } else {
+            "Only normalize punctuation, spaces, casing, and adjacent stutters; do not replace words."
+        };
+        format!(
+            "You are a Chinese voice-input proofreader, not a chat assistant. Return only the cleaned original text without explanation, title, quotes, or Markdown. {correction} Use English half-width punctuation only. Do not put periods in the middle of Chinese sentences; use commas for clause boundaries. Do not add a trailing period. Preserve all numbers, names, URLs, paths, commands, negation, temporal order, and intent. Context terms: {vocabulary}. Recent dictation context for terminology only: {memory}."
+        )
+    };
+    let request = ChatRequest {
+        provider_id: None,
+        messages: Vec::new(),
+        attachments: Vec::new(),
+        screen_image: None,
+        web_search: false,
+    };
+    let result = async {
+        let (provider, key, _, _) = resolve_chat_provider(&request)?;
+        let client = shared_http_client();
+        let messages = vec![
+            ChatMessage { role: "system".to_string(), content: instruction },
+            ChatMessage { role: "user".to_string(), content: source },
+        ];
+        match provider.kind.as_str() {
+            "anthropic" => stream_anthropic(&client, &provider, &key, &messages, &app, &request_id, None).await,
+            "google" => stream_google(&client, &provider, &key, &messages, &app, &request_id, None).await,
+            _ => stream_openai(&client, &provider, &key, &messages, &app, &request_id, None).await,
+        }
+    }
+    .await;
+    match result {
+        Ok(()) => emit_stream_event(&app, &request_id, None, true, None),
+        Err(error) => emit_stream_event(&app, &request_id, None, true, Some(error)),
+    }
+    Ok(())
+}
+
+#[tauri::command]
 async fn chat_stream(
     app: AppHandle,
     request_id: String,
@@ -9049,6 +9350,7 @@ pub fn run() {
             chat_completion,
             optimize_image_prompt,
             chat_stream,
+            stream_dictation_transform,
             optimize_dictation,
             transcribe_dictation_audio,
             transcribe_realtime_dictation_audio,
@@ -9061,6 +9363,8 @@ pub fn run() {
             insert_text_to_active,
             replace_realtime_dictation_text,
             clear_dictation_focus_target,
+            selected_text_from_active,
+            replace_selected_text,
             get_work_area,
             set_realtime_preconnect_hint,
             is_alt_key_down,

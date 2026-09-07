@@ -79,6 +79,7 @@ type StreamPayload = { requestId: string; delta?: string; done: boolean; error?:
 type ScreenTranslationStatus = { active: boolean; loading: boolean; error?: string | null };
 type WindowPosition = { x: number; y: number };
 type WorkArea = { x: number; y: number; width: number; height: number };
+type ShortcutDictationPayload = { translateToEnglish?: boolean };
 type ContextMenuPlacement = { above: boolean; targetY?: number };
 type ComputerAction = {
   action: string;
@@ -479,6 +480,10 @@ export function Capsule() {
   const realtimeFallbackChunks = useRef<Blob[]>([]);
   const dictationGrowOrigin = useRef<WindowPosition | null>(null);
   const dictationStartedHidden = useRef(false);
+  const dictationTranslateToEnglish = useRef(false);
+  const dictationTransformRequestId = useRef<string | null>(null);
+  const dictationTransformText = useRef("");
+  const dictationTransformSelection = useRef(false);
   const stopListeningRef = useRef<((submit?: boolean) => void) | null>(null);
   const startListeningRef = useRef<((mode?: ListeningMode) => Promise<void>) | null>(null);
   const recognition = useRef<SpeechRecognitionLike | null>(null);
@@ -762,6 +767,33 @@ export function Capsule() {
     const node = dictationTranscriptRef.current;
     if (node) node.scrollLeft = node.scrollWidth;
   }, [dictationTranscript, dictationPhase]);
+
+  const startSelectionTranslation = useCallback(async () => {
+    if (dictationPanel || listeningRef.current) return;
+    const flowId = ++dictationFlowId.current;
+    try {
+      const source = (await invoke<string>("selected_text_from_active")).trim();
+      if (!source) return;
+      dictationTransformSelection.current = true;
+      dictationFinalTextRef.current = source;
+      dictationTransformText.current = "";
+      const requestId = crypto.randomUUID();
+      dictationTransformRequestId.current = requestId;
+      setDictationTranscript("");
+      setDictationError("");
+      setDictationPhase("polishing");
+      await invoke("stream_dictation_transform", {
+        requestId,
+        request: { text: source, targetLanguage: "en" },
+      });
+      if (dictationFlowId.current !== flowId) return;
+    } catch (error) {
+      if (dictationFlowId.current !== flowId) return;
+      dictationTransformSelection.current = false;
+      setDictationError(error instanceof Error ? error.message : "无法读取选中文本");
+      setDictationPhase("error");
+    }
+  }, [dictationPanel]);
 
   const closeContextMenu = useCallback(() => {
     if (contextMenu?.above && contextMenu.origin) {
@@ -1125,6 +1157,43 @@ export function Capsule() {
       endEdge();
     }
   }, [beginEdge, closeContextMenu, endEdge, handleScreenTranslationCommand, isStreaming, messages, releaseVoice, runComputerTask]);
+
+  const startDictationTransform = useCallback((source: string, previousWritten: string, translateToEnglish: boolean) => {
+    const requestId = crypto.randomUUID();
+    const flowId = dictationFlowId.current;
+    dictationTransformRequestId.current = requestId;
+    dictationTransformText.current = "";
+    dictationFinalTextRef.current = source;
+    setDictationPhase("polishing");
+    void invoke("stream_dictation_transform", {
+      requestId,
+      request: {
+        text: source,
+        targetLanguage: translateToEnglish ? "en" : undefined,
+        correctTypos: appearance.dictationCorrection,
+        vocabulary: readDictationVocabulary().join("\n"),
+        memory: appearance.dictationMemory ? readDictationMemory().join("\n") : undefined,
+      },
+    }).catch((error) => {
+      if (dictationTransformRequestId.current !== requestId || dictationFlowId.current !== flowId) return;
+      dictationTransformRequestId.current = null;
+      dictationTransformText.current = source;
+      setDictationTranscript(source);
+      setDictationPhase("inserting");
+      void realtimeDictationInsertQueue.current.then(async () => {
+        try {
+          await invoke("replace_realtime_dictation_text", { previous: previousWritten, text: source });
+          if (dictationFlowId.current === flowId) {
+            realtimeDictationWritten.current = "";
+            closeDictationPanel();
+          }
+        } catch {
+          setDictationError(error instanceof Error ? error.message : "无法写入原输入框, 可重试或复制内容");
+          setDictationPhase("error");
+        }
+      });
+    });
+  }, [appearance.dictationCorrection, appearance.dictationMemory, closeDictationPanel]);
 
   const finishDictation = useCallback(async (text: string, useTextOptimization = true) => {
     const flowId = dictationFlowId.current;
@@ -1775,6 +1844,51 @@ export function Capsule() {
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     void listen<StreamPayload>("kero:stream", ({ payload }) => {
+      if (payload.requestId !== dictationTransformRequestId.current) return;
+      const flowId = dictationFlowId.current;
+      if (payload.delta) {
+        const text = mergeStreamText(dictationTransformText.current, payload.delta);
+        dictationTransformText.current = text;
+        dictationFinalTextRef.current = text;
+        setDictationTranscript(text);
+      }
+      if (!payload.done) return;
+      dictationTransformRequestId.current = null;
+      const text = dictationTransformText.current.trim() || dictationFinalTextRef.current.trim();
+      if (payload.error || !text) {
+        const fallback = dictationFinalTextRef.current.trim();
+        dictationTransformText.current = fallback;
+        setDictationTranscript(fallback);
+      }
+      const finalText = (dictationTransformText.current.trim() || dictationFinalTextRef.current.trim());
+      dictationFinalTextRef.current = finalText;
+      if (appearance.dictationMemory && finalText && !dictationTransformSelection.current) rememberDictation(finalText);
+      setDictationPhase("inserting");
+      const previousWritten = realtimeDictationWritten.current;
+      void realtimeDictationInsertQueue.current.then(async () => {
+        try {
+          if (dictationTransformSelection.current) {
+            await invoke("replace_selected_text", { text: finalText });
+          } else {
+            await invoke("replace_realtime_dictation_text", { previous: previousWritten, text: finalText });
+          }
+          if (dictationFlowId.current !== flowId) return;
+          dictationTransformSelection.current = false;
+          realtimeDictationWritten.current = "";
+          closeDictationPanel();
+        } catch {
+          if (dictationFlowId.current !== flowId) return;
+          setDictationError("无法写入原输入框, 可重试或复制内容");
+          setDictationPhase("error");
+        }
+      });
+    }).then((listener) => { unlisten = listener; });
+    return () => unlisten?.();
+  }, [appearance.dictationMemory, closeDictationPanel]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    void listen<StreamPayload>("kero:stream", ({ payload }) => {
       if (payload.requestId !== activeRequestId.current) return;
       const pendingId = assistantMessageId.current;
       const delta = payload.delta;
@@ -1867,8 +1981,8 @@ export function Capsule() {
       if (payload.error) {
         resetToListeningOff();
         const fallbackBlob = takeRealtimeFallbackBlob();
-        if (!transcript && fallbackBlob) {
-          // 流式会话失败且没有任何转写 → 用并行录制的整段音频走批量识别。
+        if (fallbackBlob) {
+          // 流式 WS 中断：并行录下的整段音频作为权威恢复结果，不拼接部分文本，避免重复或漏字。
           void finishAiDictation(fallbackBlob);
           return;
         }
@@ -1886,44 +2000,21 @@ export function Capsule() {
         return;
       }
       setDictationTranscript(transcript);
-      if (appearance.aiDictationPolish) {
-        resetToListeningOff();
-        setDictationPhase("polishing");
-        const beforePolish = realtimeDictationWritten.current;
-        void invoke<string>("optimize_dictation", {
-          text: transcript,
-          correctTypos: appearance.dictationCorrection,
-          vocabulary: readDictationVocabulary().join("\n"),
-          memory: appearance.dictationMemory ? readDictationMemory().join("\n") : undefined,
-        }).catch(() => transcript).then(async (optimized) => {
-          if (dictationFlowId.current !== flowId) return;
-          const text = optimized.trim() || transcript;
-          dictationFinalTextRef.current = text;
-          if (appearance.dictationMemory) rememberDictation(text);
-          setDictationPhase("inserting");
-          try {
-            await realtimeDictationInsertQueue.current;
-            await invoke("replace_realtime_dictation_text", { previous: beforePolish, text });
-            if (dictationFlowId.current !== flowId) return;
-            realtimeDictationWritten.current = "";
-            closeDictationPanel();
-          } catch {
-            realtimeDictationInputFailed.current = true;
-            setDictationError("无法写入原输入框，可重试或复制内容");
-            setDictationPhase("error");
-          }
-        });
+      resetToListeningOff();
+      const beforeTransform = realtimeDictationWritten.current;
+      if (dictationTranslateToEnglish.current || appearance.aiDictationPolish) {
+        startDictationTransform(transcript, beforeTransform, dictationTranslateToEnglish.current);
       } else {
-        resetToListeningOff();
-        // 收尾补打：松开 Alt 后被节流掉的尾部在这里一次性写入（差量，内容一致时无击键）。
+        // 未开启 AI 润色的普通听写保持最短路径：补齐最后的识别文本后直接收起。
+        setDictationPhase("inserting");
         void realtimeDictationInsertQueue.current.then(async () => {
-          if (dictationFlowId.current !== flowId) return;
           try {
-            await invoke("replace_realtime_dictation_text", { previous: realtimeDictationWritten.current, text: transcript });
+            await invoke("replace_realtime_dictation_text", { previous: beforeTransform, text: transcript });
             if (dictationFlowId.current !== flowId) return;
             realtimeDictationWritten.current = "";
             closeDictationPanel();
           } catch {
+            if (dictationFlowId.current !== flowId) return;
             dictationFinalTextRef.current = transcript;
             setDictationError("无法写入原输入框, 可重试或复制内容");
             setDictationPhase("error");
@@ -2043,11 +2134,14 @@ export function Capsule() {
     let stopClickThrough: (() => void) | undefined;
     let stopDictationStart: (() => void) | undefined;
     let stopDictationEnd: (() => void) | undefined;
+    let stopDictationMode: (() => void) | undefined;
+    let stopSelectionTranslation: (() => void) | undefined;
     void listen<boolean>("kero:click-through-changed", ({ payload }) => updateAppearance({ clickThrough: payload }, false))
       .then((unlisten) => { stopClickThrough = unlisten; });
-    void listen("kero:shortcut-dictation-start", () => {
+    void listen<ShortcutDictationPayload>("kero:shortcut-dictation-start", ({ payload }) => {
       const sessionId = ++dictationSessionId.current;
       dictationHeldRef.current = true;
+      dictationTranslateToEnglish.current = payload?.translateToEnglish === true;
       dictationOpenedFromTray.current = false;
       trayDictationSessionId.current = null;
       void (async () => {
@@ -2072,7 +2166,16 @@ export function Capsule() {
         }
       })();
     }).then((unlisten) => { stopDictationStart = unlisten; });
-    void listen("kero:shortcut-dictation-stop", () => {
+    void listen<ShortcutDictationPayload>("kero:shortcut-dictation-mode", ({ payload }) => {
+      if (payload?.translateToEnglish === true && dictationHeldRef.current) {
+        dictationTranslateToEnglish.current = true;
+      }
+    }).then((unlisten) => { stopDictationMode = unlisten; });
+    void listen("kero:shortcut-selection-translate", () => {
+      void startSelectionTranslation();
+    }).then((unlisten) => { stopSelectionTranslation = unlisten; });
+    void listen<ShortcutDictationPayload>("kero:shortcut-dictation-stop", ({ payload }) => {
+      if (payload?.translateToEnglish === true) dictationTranslateToEnglish.current = true;
       requestDictationStop();
     }).then((unlisten) => { stopDictationEnd = unlisten; });
     let stopDictationCancel: (() => void) | undefined;
@@ -2083,6 +2186,8 @@ export function Capsule() {
       stopClickThrough?.();
       stopDictationStart?.();
       stopDictationEnd?.();
+      stopDictationMode?.();
+      stopSelectionTranslation?.();
       stopDictationCancel?.();
     };
   }, [cancelDictation, hideAfterTrayDictation, requestDictationStop, startListening, updateAppearance]);
