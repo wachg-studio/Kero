@@ -331,6 +331,9 @@ html, body, #root { background: rgba(255, 255, 255, 0) !important; background-co
 .dictation-middle > * { flex: 0 0 auto; }
 .dictation-text-content { white-space: pre; }
 .dictation-error-msg { color: rgba(255, 255, 255, .78); font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.dictation-transforming { display: inline-flex; align-items: center; gap: 9px; color: rgba(255, 255, 255, .68); font-size: 12px; white-space: nowrap; }
+.dictation-transforming .dictation-live-wave { gap: 2px; }
+.dictation-transforming .dictation-live-wave i { width: 2px; height: 11px; background: rgba(255, 255, 255, .58); }
 .dictation-live-wave { display: inline-flex; align-items: center; gap: 3px; }
 .dictation-live-wave i { display: block; width: 2.5px; border-radius: 2px; background: rgba(255, 255, 255, .55); transition: height 70ms ease; }
 .dictation-live-wave.is-strip { flex: 1 0 auto; justify-content: center; }

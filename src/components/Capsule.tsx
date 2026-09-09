@@ -53,7 +53,7 @@ type RealtimeDictationEvent = {
   error?: string | null;
 };
 
-type DictationPhase = "idle" | "listening" | "finishing" | "recognizing" | "polishing" | "inserting" | "error";
+type DictationPhase = "idle" | "listening" | "finishing" | "recognizing" | "polishing" | "translating" | "inserting" | "error";
 
 // 灵动听写条：单行高度，文字从中间向两侧拉长，宽度封顶后内部横向滚动。
 const dictationPillHeight = 48;
@@ -777,7 +777,7 @@ export function Capsule() {
       dictationTransformSelection.current = true;
       dictationFinalTextRef.current = source;
       dictationTransformText.current = "";
-      const requestId = crypto.randomUUID();
+      const requestId = `dictation-transform:${crypto.randomUUID()}`;
       dictationTransformRequestId.current = requestId;
       setDictationTranscript("");
       setDictationError("");
@@ -1159,12 +1159,12 @@ export function Capsule() {
   }, [beginEdge, closeContextMenu, endEdge, handleScreenTranslationCommand, isStreaming, messages, releaseVoice, runComputerTask]);
 
   const startDictationTransform = useCallback((source: string, previousWritten: string, translateToEnglish: boolean) => {
-    const requestId = crypto.randomUUID();
+    const requestId = `dictation-transform:${crypto.randomUUID()}`;
     const flowId = dictationFlowId.current;
     dictationTransformRequestId.current = requestId;
     dictationTransformText.current = "";
     dictationFinalTextRef.current = source;
-    setDictationPhase("polishing");
+    setDictationPhase(translateToEnglish ? "translating" : "polishing");
     void invoke("stream_dictation_transform", {
       requestId,
       request: {
@@ -2329,12 +2329,19 @@ export function Capsule() {
           <div className="dictation-pill">
             <button type="button" className="dictation-end" title="取消听写 (Esc)" onClick={cancelDictation}><X size={13} /></button>
             <div
-              className={`dictation-middle ${dictationPhase === "polishing" ? "is-polishing" : ""}`}
+              className={`dictation-middle ${dictationPhase === "polishing" || dictationPhase === "translating" ? "is-polishing" : ""}`}
               ref={dictationTranscriptRef}
               title={dictationPhase === "error" ? (dictationError || "无法写入原输入框") : undefined}
             >
               {dictationPhase === "error" ? (
                 <span className="dictation-error-msg">{dictationError || "无法写入原输入框"}</span>
+              ) : (dictationPhase === "translating" || dictationPhase === "polishing") && !dictationTranscript ? (
+                <span className="dictation-transforming" aria-live="polite">
+                  <span className="dictation-live-wave is-strip is-working" aria-hidden="true">
+                    {dictationWaveFactors.slice(0, 12).map((factor, index) => <i key={index} />)}
+                  </span>
+                  <span>{dictationPhase === "translating" ? "翻译中" : "整理中"}</span>
+                </span>
               ) : dictationTranscript ? (
                 <>
                   <span className="dictation-text-content">{dictationTranscript}</span>

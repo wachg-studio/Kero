@@ -38,7 +38,8 @@ static ALT_HELD: AtomicBool = AtomicBool::new(false);
 static CTRL_HELD: AtomicBool = AtomicBool::new(false);
 static E_HELD: AtomicBool = AtomicBool::new(false);
 static ALT_DICTATION_ENGLISH: AtomicBool = AtomicBool::new(false);
-static CTRL_EF_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+static CTRL_F_PREFIX: AtomicBool = AtomicBool::new(false);
+static CTRL_F_ACTIVE: AtomicBool = AtomicBool::new(false);
 // A bare Alt release activates the foreground app's menu bar on Windows. When
 // Alt starts an external dictation session, consume that whole key cycle.
 static ALT_DICTATION_SUPPRESSED: AtomicBool = AtomicBool::new(false);
@@ -537,14 +538,24 @@ unsafe extern "system" fn keyboard_hook(code: i32, message: usize, data: isize) 
             let is_released = message as u32 == WM_KEYUP || message as u32 == WM_SYSKEYUP;
             if (key == 0x11 || key == 0xa2 || key == 0xa3) && !is_injected {
                 CTRL_HELD.store(is_pressed && !is_released, Ordering::SeqCst);
-                if is_released && CTRL_EF_SUPPRESSED.swap(false, Ordering::SeqCst) {
+                if is_released && CTRL_F_ACTIVE.load(Ordering::SeqCst) {
+                    CTRL_F_ACTIVE.store(false, Ordering::SeqCst);
+                    CTRL_F_PREFIX.store(false, Ordering::SeqCst);
                     return true;
                 }
+                if is_released {
+                    CTRL_F_PREFIX.store(false, Ordering::SeqCst);
+                }
             }
-            if key == 0x46 && !is_injected && is_pressed && CTRL_HELD.load(Ordering::SeqCst) && E_HELD.load(Ordering::SeqCst) {
-                // Ctrl+E+F：捕获当前外部输入框的选区，前端随后流式翻译并覆盖选区。
+            if key == 0x46 && !is_injected && is_pressed && CTRL_HELD.load(Ordering::SeqCst) {
+                // Ctrl+F+F7：Ctrl+F 只进入前缀状态，按 F7 才捕获选区并触发翻译。
+                CTRL_F_PREFIX.store(true, Ordering::SeqCst);
+                return true;
+            }
+            if key == 0x76 && !is_injected && is_pressed && CTRL_HELD.load(Ordering::SeqCst) && CTRL_F_PREFIX.load(Ordering::SeqCst) {
                 let captured = capture_focus_target();
-                CTRL_EF_SUPPRESSED.store(captured, Ordering::SeqCst);
+                CTRL_F_PREFIX.store(false, Ordering::SeqCst);
+                CTRL_F_ACTIVE.store(captured, Ordering::SeqCst);
                 if captured {
                     if let Some(app) = HOTKEY_APP.get() {
                         let _ = app.emit_to("main", "kero:shortcut-selection-translate", ());
@@ -4899,10 +4910,17 @@ async fn stream_openai(
             json!({ "role": message.role, "content": message.content })
         }
     }).collect::<Vec<_>>();
+    let compact = request_id.starts_with("dictation-transform:");
     let response = client
         .post(url)
         .bearer_auth(key)
-        .json(&json!({ "model": provider.model, "messages": request_messages, "stream": true, "max_tokens": if screen_image.is_some() { 512 } else { 2048 } }))
+        .json(&json!({
+            "model": provider.model,
+            "messages": request_messages,
+            "stream": true,
+            "temperature": if compact { 0.1 } else { 0.7 },
+            "max_tokens": if compact { 512 } else if screen_image.is_some() { 512 } else { 2048 }
+        }))
         .send()
         .await
         .map_err(|error| format!("无法连接模型服务: {error}"))?;
@@ -4971,13 +4989,15 @@ async fn stream_anthropic(
             } else { Ok(json!({ "role": role, "content": message.content })) }
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let compact = request_id.starts_with("dictation-transform:");
     let response = client
         .post(url)
         .header("x-api-key", key)
         .header("anthropic-version", "2023-06-01")
         .json(&json!({
             "model": provider.model,
-            "max_tokens": if screen_image.is_some() { 512 } else { 2048 },
+            "max_tokens": if compact { 512 } else if screen_image.is_some() { 512 } else { 2048 },
+            "temperature": if compact { 0.1 } else { 0.7 },
             "system": system,
             "messages": conversation,
             "stream": true
@@ -5025,12 +5045,13 @@ async fn stream_google(
             json!({ "role": if message.role == "assistant" { "model" } else { "user" }, "parts": parts })
         })
         .collect::<Vec<_>>();
+    let compact = request_id.starts_with("dictation-transform:");
     let response = client
         .post(url)
         .json(&json!({
             "systemInstruction": { "parts": [{ "text": system }] },
             "contents": contents,
-            "generationConfig": { "temperature": 0.7, "maxOutputTokens": if screen_image.is_some() { 512 } else { 2048 } }
+            "generationConfig": { "temperature": if compact { 0.1 } else { 0.7 }, "maxOutputTokens": if compact { 512 } else if screen_image.is_some() { 512 } else { 2048 } }
         }))
         .send()
         .await
