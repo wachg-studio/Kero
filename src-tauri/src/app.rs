@@ -2506,8 +2506,9 @@ fn register_realtime_dictation_session(
     tokio::sync::mpsc::Receiver<RealtimeDictationCommand>,
 ) {
     let session_id = Uuid::new_v4().to_string();
-    // 100ms PCM 一帧，容量 40 即最多约 4 秒缓存：网络异常时内存有确定上限。
-    let (sender, receiver) = tokio::sync::mpsc::channel(40);
+    // 100ms PCM 一帧，容量 150 即最多约 15 秒缓存：覆盖一次重连握手的窗口，
+    // 网络异常时内存仍有确定上限；溢出帧由 push 侧按过期丢弃。
+    let (sender, receiver) = tokio::sync::mpsc::channel(150);
     realtime_dictation_sessions()
         .lock()
         .unwrap()

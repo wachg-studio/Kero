@@ -40,7 +40,8 @@ type RealtimeDictationCapture = {
   processor: AudioWorkletNode;
   source: MediaStreamAudioSourceNode;
   silentGain: GainNode;
-  sessionId: string;
+  // 会话启动失败时采集仍在进行（sessionId 为空），恢复时用 PCM 环形缓冲重放识别。
+  sessionId: string | null;
   sendQueue: Promise<void>;
   sampleRate: number;
 };
@@ -59,6 +60,9 @@ type DictationPhase = "idle" | "listening" | "finishing" | "recognizing" | "poli
 const dictationPillHeight = 48;
 const dictationPillMinWidth = 168;
 const dictationPillMaxWidth = 720;
+// 流式听写期间在前端保留一份 PCM 副本：会话启动失败/中途断开/结束却无转写时，
+// 用它走重放识别恢复，避免"按住了却没识别到"。
+const DICTATION_PCM_RING_SECONDS = 120;
 // 中间实时声波的 22 根细条：静默时收敛成小点，说话时按麦克风能量拉成波形。
 const dictationWaveFactors = [0.4, 0.72, 0.5, 0.92, 0.62, 1, 0.7, 0.86, 0.52, 0.78, 0.96, 0.6, 0.82, 0.46, 0.9, 0.66, 1, 0.72, 0.56, 0.88, 0.5, 0.64];
 
@@ -479,7 +483,13 @@ export function Capsule() {
   const realtimeFallbackRecorder = useRef<MediaRecorder | null>(null);
   const realtimeFallbackChunks = useRef<Blob[]>([]);
   const dictationGrowOrigin = useRef<WindowPosition | null>(null);
+  const capsuleHomeRef = useRef<WindowPosition | null>(null);
+  const lastPillPlacement = useRef<{ x: number; y: number } | null>(null);
   const dictationStartedHidden = useRef(false);
+  const dictationPcmRing = useRef<Int16Array[]>([]);
+  const dictationPcmRingSamples = useRef(0);
+  const dictationPcmRate = useRef(16000);
+  const dictationRetryAudio = useRef<{ kind: "pcm"; pcmBase64: string; sampleRate: number } | { kind: "blob"; blob: Blob } | null>(null);
   const dictationTranslateToEnglish = useRef(false);
   const dictationTransformRequestId = useRef<string | null>(null);
   const dictationTransformText = useRef("");
@@ -693,8 +703,37 @@ export function Capsule() {
     }
   }, []);
 
+  // ---- PCM 环形缓冲：流式听写的本地音频副本，用于失败后的权威恢复 ----
+  const resetPcmRing = useCallback((rate: number) => {
+    dictationPcmRing.current = [];
+    dictationPcmRingSamples.current = 0;
+    dictationPcmRate.current = rate;
+  }, []);
+
+  const appendPcmRing = useCallback((chunk: Int16Array) => {
+    if (chunk.length === 0) return;
+    dictationPcmRing.current.push(chunk);
+    dictationPcmRingSamples.current += chunk.length;
+    const maxSamples = dictationPcmRate.current * DICTATION_PCM_RING_SECONDS;
+    while (dictationPcmRingSamples.current > maxSamples && dictationPcmRing.current.length > 1) {
+      dictationPcmRingSamples.current -= dictationPcmRing.current[0].length;
+      dictationPcmRing.current.shift();
+    }
+  }, []);
+
+  const drainPcmRing = useCallback(() => {
+    const chunks = dictationPcmRing.current;
+    dictationPcmRing.current = [];
+    dictationPcmRingSamples.current = 0;
+    if (!chunks.length) return null;
+    return { pcmBase64: pcmToBase64(chunks), sampleRate: dictationPcmRate.current };
+  }, []);
+
   const closeDictationPanel = useCallback(() => {
     takeRealtimeFallbackBlob();
+    dictationPcmRing.current = [];
+    dictationPcmRingSamples.current = 0;
+    dictationRetryAudio.current = null;
     setDictationPhase("idle");
     setDictationTranscript("");
     setDictationError("");
@@ -1195,6 +1234,56 @@ export function Capsule() {
     });
   }, [appearance.dictationCorrection, appearance.dictationMemory, closeDictationPanel]);
 
+  // 用本地 PCM 副本重放识别：流式会话启动失败/中途断开/结束无转写时的权威恢复路径。
+  const finishPcmDictation = useCallback(async (pcmBase64: string, sampleRate: number) => {
+    const flowId = dictationFlowId.current;
+    dictationRetryAudio.current = { kind: "pcm", pcmBase64, sampleRate };
+    setDictationPhase("recognizing");
+    try {
+      const text = await invoke<string>("transcribe_realtime_dictation_audio", { pcmBase64, sampleRate });
+      if (dictationFlowId.current !== flowId) return;
+      const transcript = text.trim();
+      if (!transcript) throw new Error("语音识别没有听到有效内容");
+      transcriptRef.current = transcript;
+      finalTranscriptRef.current = transcript;
+      setDictationTranscript(transcript);
+      releaseVoice();
+      listeningRef.current = false;
+      listeningMode.current = "chat";
+      setListening(false);
+      setIsDictating(false);
+      const beforeTransform = realtimeDictationWritten.current;
+      if (dictationTranslateToEnglish.current || appearance.aiDictationPolish) {
+        startDictationTransform(transcript, beforeTransform, dictationTranslateToEnglish.current);
+      } else {
+        setDictationPhase("inserting");
+        void realtimeDictationInsertQueue.current.then(async () => {
+          try {
+            await invoke("replace_realtime_dictation_text", { previous: beforeTransform, text: transcript });
+            if (dictationFlowId.current !== flowId) return;
+            realtimeDictationWritten.current = "";
+            closeDictationPanel();
+          } catch {
+            if (dictationFlowId.current !== flowId) return;
+            dictationFinalTextRef.current = transcript;
+            setDictationError("无法写入原输入框, 可重试或复制内容");
+            setDictationPhase("error");
+          }
+        });
+      }
+    } catch (error) {
+      if (dictationFlowId.current !== flowId) return;
+      void invoke("clear_dictation_focus_target");
+      releaseVoice();
+      listeningRef.current = false;
+      listeningMode.current = "chat";
+      setListening(false);
+      setIsDictating(false);
+      setDictationError(error instanceof Error ? error.message : "语音识别失败");
+      setDictationPhase("error");
+    }
+  }, [appearance.aiDictationPolish, closeDictationPanel, releaseVoice, startDictationTransform]);
+
   const finishDictation = useCallback(async (text: string, useTextOptimization = true) => {
     const flowId = dictationFlowId.current;
     const raw = text.trim();
@@ -1230,6 +1319,7 @@ export function Capsule() {
 
   const finishAiDictation = useCallback(async (blob: Blob) => {
     const flowId = dictationFlowId.current;
+    dictationRetryAudio.current = { kind: "blob", blob };
     setDictationPhase("recognizing");
     try {
       const audioBase64 = await blobToBase64(blob);
@@ -1402,7 +1492,24 @@ export function Capsule() {
       realtimeCapture.source.disconnect();
       realtimeCapture.silentGain.disconnect();
       void realtimeCapture.context.close();
-      void realtimeCapture.sendQueue.finally(() => finishRealtimeAiDictation(realtimeCapture.sessionId));
+      if (realtimeCapture.sessionId) {
+        void realtimeCapture.sendQueue.finally(() => finishRealtimeAiDictation(realtimeCapture.sessionId as string));
+        return;
+      }
+      // 会话从未建立成功（启动失败）：用本地 PCM 副本直接重放识别，不再白等。
+      releaseVoice();
+      listeningRef.current = false;
+      listeningMode.current = "chat";
+      setListening(false);
+      setIsDictating(false);
+      const pcm = drainPcmRing();
+      if (pcm) {
+        void finishPcmDictation(pcm.pcmBase64, pcm.sampleRate);
+      } else {
+        void invoke("clear_dictation_focus_target");
+        setDictationError("语音识别连接失败，请重试");
+        setDictationPhase("error");
+      }
       return;
     }
     if (recorder && recorder.state !== "inactive") {
@@ -1425,18 +1532,25 @@ export function Capsule() {
       stopListeningRef.current?.(true);
       return;
     }
-  }, [clearRealtimeReplaceTimer, finishRealtimeAiDictation]);
+  }, [clearRealtimeReplaceTimer, drainPcmRing, finishPcmDictation, finishRealtimeAiDictation, releaseVoice]);
 
-  // 听写条确认按钮：聆听中点击等于松开 Alt（收尾→润色→写入）；出错时点击重试写入。
+  // 听写条确认按钮：聆听中点击等于松开 Alt（收尾→润色→写入）；出错时优先重试识别（保留的音频），否则重试写入。
   const confirmDictation = useCallback(() => {
     if (dictationPhase === "error") {
+      const savedText = dictationFinalTextRef.current.trim();
+      const retryAudio = dictationRetryAudio.current;
+      if (!savedText && retryAudio) {
+        if (retryAudio.kind === "pcm") void finishPcmDictation(retryAudio.pcmBase64, retryAudio.sampleRate);
+        else void finishAiDictation(retryAudio.blob);
+        return;
+      }
       retryDictationInsert();
       return;
     }
     if (listeningRef.current && listeningMode.current === "dictation") {
       requestDictationStop();
     }
-  }, [dictationPhase, requestDictationStop, retryDictationInsert]);
+  }, [dictationPhase, finishAiDictation, finishPcmDictation, requestDictationStop, retryDictationInsert]);
 
   const startListening = useCallback(async (mode: ListeningMode = "chat") => {
     if (isStreamingRef.current || listeningRef.current) return;
@@ -1622,8 +1736,10 @@ export function Capsule() {
       if (useAiDictation) {
         setDictationPhase("listening");
         let captureActive = false;
-        if (realtimeSession) {
-          const outputRate = realtimeSession.sampleRate;
+        if (useRealtime) {
+          // 流式模型：PCM 采集与会话解耦——会话启动失败时照样采集，
+          // 本地环形缓冲（上限 120s）作为失败/中断/无转写时的权威恢复来源。
+          const outputRate = realtimeSession?.sampleRate ?? 16000;
           const captureContext = new AudioContext({ latencyHint: "interactive" });
           if (captureContext.state === "suspended") await captureContext.resume().catch(() => undefined);
           const captureSource = captureContext.createMediaStreamSource(stream);
@@ -1636,43 +1752,32 @@ export function Capsule() {
               processor: worklet,
               source: captureSource,
               silentGain,
-              sessionId: realtimeSession.sessionId,
+              sessionId: realtimeSession?.sessionId ?? null,
               sendQueue: Promise.resolve(),
               sampleRate: outputRate,
             };
             realtimeDictationText.current = "";
             realtimeDictationWritten.current = "";
             realtimeDictationInputFailed.current = false;
+            resetPcmRing(outputRate);
             worklet.port.onmessage = (event) => {
               const pcm = new Int16Array(event.data as ArrayBuffer);
+              appendPcmRing(pcm);
+              const sessionId = capture.sessionId;
+              if (!sessionId) return;
               capture.sendQueue = capture.sendQueue
-                .then(() => invoke("push_realtime_dictation_audio", { sessionId: capture.sessionId, pcmBase64: pcmToBase64([pcm]) }).then(() => undefined))
+                .then(() => invoke("push_realtime_dictation_audio", { sessionId, pcmBase64: pcmToBase64([pcm]) }).then(() => undefined))
                 .catch(() => undefined);
             };
             captureSource.connect(worklet);
             worklet.connect(silentGain);
             silentGain.connect(captureContext.destination);
             realtimeDictationCapture.current = capture;
-            realtimeDictationSessionId.current = capture.sessionId;
+            if (realtimeSession) realtimeDictationSessionId.current = realtimeSession.sessionId;
             captureActive = true;
-            // 并行录制整段音频：流式会话中途失败且没有转写时，用它走批量识别兜底。
-            const fallbackMime = dictationRecorderMimeType();
-            if (fallbackMime) {
-              try {
-                const fallbackRecorder = new MediaRecorder(stream, { mimeType: fallbackMime, audioBitsPerSecond: 48_000 });
-                realtimeFallbackChunks.current = [];
-                fallbackRecorder.ondataavailable = (event) => {
-                  if (event.data.size > 0) realtimeFallbackChunks.current.push(event.data);
-                };
-                realtimeFallbackRecorder.current = fallbackRecorder;
-                fallbackRecorder.start();
-              } catch {
-                // 兜底录音不可用只损失降级能力，不影响流式识别。
-              }
-            }
           } catch (error) {
             console.warn("流式音频采集不可用，回退整段识别", error);
-            void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
+            if (realtimeSession) void invoke("finish_realtime_dictation", { sessionId: realtimeSession.sessionId }).catch(() => undefined);
             realtimeDictationSessionId.current = null;
             captureContext.close().catch(() => undefined);
             captureActive = false;
@@ -1738,7 +1843,7 @@ export function Capsule() {
       }
       stopListening(false);
     }
-  }, [appearance.autoSend, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, beginEdge, closeContextMenu, emitEdge, finishAiDictation, hideAfterTrayDictation, requestDictationStop, stopListening]);
+  }, [appearance.autoSend, appearance.dictationMode, appearance.edgeEnabled, appearance.realtimeEdgeEnabled, appendPcmRing, beginEdge, closeContextMenu, emitEdge, finishAiDictation, hideAfterTrayDictation, requestDictationStop, resetPcmRing, stopListening]);
 
   startListeningRef.current = startListening;
 
@@ -1980,9 +2085,14 @@ export function Capsule() {
       };
       if (payload.error) {
         resetToListeningOff();
+        // 优先用本地 PCM 副本重放识别（realtime 模型在批量接口上不可用）；恢复期间保留焦点目标。
+        const pcm = drainPcmRing();
+        if (pcm) {
+          void finishPcmDictation(pcm.pcmBase64, pcm.sampleRate);
+          return;
+        }
         const fallbackBlob = takeRealtimeFallbackBlob();
         if (fallbackBlob) {
-          // 流式 WS 中断：并行录下的整段音频作为权威恢复结果，不拼接部分文本，避免重复或漏字。
           void finishAiDictation(fallbackBlob);
           return;
         }
@@ -1994,6 +2104,12 @@ export function Capsule() {
       }
       if (!transcript) {
         resetToListeningOff();
+        // 结束却无转写（如认领的预连接已被服务端闲置断开、开头音频丢失）：用 PCM 副本重放恢复。
+        const pcm = drainPcmRing();
+        if (pcm) {
+          void finishPcmDictation(pcm.pcmBase64, pcm.sampleRate);
+          return;
+        }
         void invoke("clear_dictation_focus_target");
         setDictationError("没有听到有效内容，再试一次吧");
         setDictationPhase("error");
@@ -2023,7 +2139,7 @@ export function Capsule() {
       }
     }).then((listener) => { unlisten = listener; });
     return () => unlisten?.();
-  }, [appearance.aiDictationPolish, appearance.dictationCorrection, appearance.dictationMemory, applyRealtimeReplace, closeDictationPanel, finishAiDictation, releaseVoice, takeRealtimeFallbackBlob]);
+  }, [appearance.aiDictationPolish, appearance.dictationCorrection, appearance.dictationMemory, applyRealtimeReplace, closeDictationPanel, drainPcmRing, finishAiDictation, finishPcmDictation, releaseVoice, takeRealtimeFallbackBlob]);
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
@@ -2071,11 +2187,6 @@ export function Capsule() {
           win.scaleFactor().catch(() => 1),
           invoke<WorkArea>("get_work_area").catch(() => null),
         ]);
-        // origin 为空说明这一轮听写条还没定位过：直接切换出现，之后的长宽变化才走动画。
-        const firstPlacement = position !== null && !dictationGrowOrigin.current;
-        if (position && !dictationGrowOrigin.current) {
-          dictationGrowOrigin.current = { x: position.x, y: position.y };
-        }
         let restoreX: number | undefined;
         let restoreY: number | undefined;
         if (workArea) {
@@ -2085,7 +2196,20 @@ export function Capsule() {
           const margin = Math.round(16 * scaleValue);
           restoreX = workArea.x + Math.round((workArea.width - pillPhysicalWidth) / 2);
           restoreY = workArea.y + workArea.height - pillPhysicalHeight - margin;
+          lastPillPlacement.current = { x: restoreX, y: restoreY };
         }
+        // 竞态防护：上一次听写条的收起还没落盘时，窗口位置可能仍是听写条位置，
+        // 不能把它记成胶囊原位；用持久 home 兜底，收起时总能回到真正的原位。
+        const pill = lastPillPlacement.current;
+        const isPillSpot = pill !== null && position !== null
+          && Math.abs(position.x - pill.x) <= 8 && Math.abs(position.y - pill.y) <= 8;
+        if (position && !isPillSpot) {
+          capsuleHomeRef.current = { x: position.x, y: position.y };
+        }
+        if (!dictationGrowOrigin.current) {
+          dictationGrowOrigin.current = capsuleHomeRef.current;
+        }
+        const firstPlacement = position !== null && !isPillSpot;
         if (cancelled) return;
         if (firstPlacement) {
           await invoke("hide_window", { label: "main" }).catch(() => undefined);
@@ -2102,9 +2226,9 @@ export function Capsule() {
     }
     const height = menuOpen ? contextMenuHeight : realtimePermissionOpen ? 174 : conversationVisible ? inlineHeight : 72;
     const restore = conversationVisible ? null : collapseTarget;
-    if (dictationGrowOrigin.current && !conversationVisible && !menuOpen && !realtimePermissionOpen) {
+    const origin = dictationGrowOrigin.current ?? capsuleHomeRef.current;
+    if (origin && !conversationVisible && !menuOpen && !realtimePermissionOpen) {
       // 听写结束：胶囊直接在原位恢复，不做收回去的动画；从托盘唤起的保持隐藏。
-      const origin = dictationGrowOrigin.current;
       dictationGrowOrigin.current = null;
       const restoreShow = !dictationStartedHidden.current;
       void (async () => {
@@ -2371,7 +2495,7 @@ export function Capsule() {
             <button
               type="button"
               className="dictation-end is-confirm"
-              title={dictationPhase === "error" ? "重试写入" : "结束并写入"}
+              title={dictationPhase === "error" ? (dictationFinalTextRef.current.trim() ? "重试写入" : "重试识别") : "结束并写入"}
               disabled={dictationPhase !== "listening" && dictationPhase !== "error"}
               onClick={confirmDictation}
             >{dictationPhase === "error" ? <RotateCcw size={13} /> : <Check size={14} />}</button>
