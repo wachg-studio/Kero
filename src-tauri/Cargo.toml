@@ -1,6 +1,6 @@
 [package]
 name = "kero"
-version = "2.0.0"
+version = "3.0.0"
 description = "A calm desktop AI assistant"
 authors = ["Kero"]
 edition = "2021"

@@ -1,5 +1,5 @@
 #define MyAppName "Kero AI 助手"
-#define MyAppVersion "2.0.0"
+#define MyAppVersion "3.0.0"
 #define MyAppPublisher "Kero"
 #define MyAppExeName "kero.exe"
 
@@ -12,7 +12,7 @@ DefaultDirName={localappdata}\Kero
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 OutputDir=C:\Users\32910\Desktop
-OutputBaseFilename=Kero-Setup-2.0.0
+OutputBaseFilename=Kero-Setup-3.0.0
 SetupIconFile=..\src-tauri\icons\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/ultra64
