@@ -29,6 +29,7 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 mod dictation;
+mod local_asr;
 #[cfg(windows)]
 use dictation::capture_focus_target;
 
@@ -9373,6 +9374,11 @@ pub fn run() {
             optimize_image_prompt,
             chat_stream,
             stream_dictation_transform,
+            local_asr::get_local_asr_state,
+            local_asr::download_local_asr_model,
+            local_asr::cancel_local_asr_download,
+            local_asr::unload_local_asr,
+            local_asr::transcribe_local_dictation,
             optimize_dictation,
             transcribe_dictation_audio,
             transcribe_realtime_dictation_audio,

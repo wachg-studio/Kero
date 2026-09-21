@@ -31,7 +31,7 @@ const defaultUrl: Record<ProviderKind, string> = {
 
 type CapsuleSize = "compact" | "standard" | "wide";
 type EdgeColorMode = "rainbow" | "blue";
-type DictationRecognitionMode = "native" | "ai";
+type DictationRecognitionMode = "native" | "ai" | "local";
 
 type Appearance = {
   opacity: number;
@@ -140,7 +140,7 @@ function readAppearance(): Appearance {
       dictationCorrection: saved.dictationCorrection !== false,
       dictationMemory: saved.dictationMemory !== false,
       dictationEdgeEnabled: saved.dictationEdgeEnabled !== false,
-      dictationMode: saved.dictationMode === "native" ? "native" : "ai",
+      dictationMode: saved.dictationMode === "native" ? "native" : saved.dictationMode === "local" ? "local" : "ai",
       aiDictationPolish: saved.aiDictationPolish === true,
       realtimeEdgeEnabled: saved.realtimeEdgeEnabled !== false,
       clickThrough: saved.clickThrough === true,
@@ -588,6 +588,7 @@ export function SettingsWindow() {
               </p>
               <div className="image-provider-choice" role="group" aria-label="语音识别模式">
                 <button type="button" className={appearance.dictationMode === "ai" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "ai" })}>AI 语音识别（推荐）</button>
+                <button type="button" className={appearance.dictationMode === "local" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "local" })}>本地离线识别</button>
                 <button type="button" className={appearance.dictationMode === "native" ? "selected" : ""} onClick={() => updateAppearance({ dictationMode: "native" })}>原生语音识别</button>
               </div>
               {appearance.dictationMode === "ai" && <>
@@ -610,6 +611,9 @@ export function SettingsWindow() {
                 {dictationAsrNotice && <p className={`form-notice ${dictationAsrNotice.startsWith("AI 语音识别配置") ? "success" : ""}`}>{dictationAsrNotice}</p>}
                 <button type="button" className="save-image-generation" disabled={savingDictationAsr || !dictationAsr.model.trim()} onClick={() => void saveDictationAsr()}><Save size={14} /> {savingDictationAsr ? "正在保存" : "保存 AI 语音识别配置"}</button>
               </>}
+              {appearance.dictationMode === "local" && (
+                <LocalAsrManager />
+              )}
             </section>
             <div className="system-prompt-settings">
               <button
@@ -766,5 +770,89 @@ export function SettingsWindow() {
         </section>
       </div>
     </main>
+  );
+}
+
+type LocalAsrState = { installed: boolean; modelDir: string; downloading: boolean; loaded: boolean };
+type LocalAsrDownloadEvent = { file?: string; downloaded?: number; total?: number; done?: boolean };
+
+function LocalAsrManager() {
+  const [state, setState] = useState<LocalAsrState | null>(null);
+  const [progress, setProgress] = useState<{ file: string; percent: number } | null>(null);
+  const [notice, setNotice] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const refresh = useCallback(() => {
+    void invoke<LocalAsrState>("get_local_asr_state")
+      .then(setState)
+      .catch(() => undefined);
+  }, []);
+
+  useEffect(() => {
+    refresh();
+    let unlisten: (() => void) | undefined;
+    void listen<LocalAsrDownloadEvent>("kero:local-asr-download", ({ payload }) => {
+      if (payload?.done) {
+        setBusy(false);
+        setProgress(null);
+        refresh();
+        setNotice("本地语音模型已就绪");
+        return;
+      }
+      if (payload?.total && payload.downloaded !== undefined) {
+        setProgress({ file: payload.file ?? "", percent: Math.min(100, Math.round((payload.downloaded / payload.total) * 100)) });
+      }
+    }).then((listener) => { unlisten = listener; });
+    return () => unlisten?.();
+  }, [refresh]);
+
+  const download = async () => {
+    setBusy(true);
+    setNotice("");
+    setProgress({ file: "模型压缩包", percent: 0 });
+    try {
+      await invoke("download_local_asr_model");
+      setBusy(false);
+      setProgress(null);
+      refresh();
+      setNotice("本地语音模型已就绪");
+    } catch (error) {
+      setBusy(false);
+      setProgress(null);
+      refresh();
+      setNotice(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const unload = async () => {
+    await invoke("unload_local_asr").catch(() => undefined);
+    refresh();
+    setNotice("已释放本地模型占用的内存");
+  };
+
+  return (
+    <div className="local-asr-manager">
+      <span><b>SenseVoice 本地模型（约 230MB）</b><small>{state?.installed ? "已安装：断网也能听写；首次识别需短暂加载模型。" : "尚未下载。下载后无需联网即可完成语音转文字（润色和英译仍需联网模型）。"}</small></span>
+      {busy && progress && (
+        <div className="local-asr-progress">
+          <div className="local-asr-progress-track"><i style={{ width: `${progress.percent}%` }} /></div>
+          <small>{progress.file} {progress.percent}%</small>
+        </div>
+      )}
+      <div className="local-asr-actions">
+        {state?.installed
+          ? <>
+            <button type="button" onClick={() => void unload()} disabled={!state.loaded}>{state.loaded ? "释放模型内存" : "模型未加载"}</button>
+            <button type="button" className="danger" onClick={() => {
+              setBusy(true);
+              setNotice("请在文件管理器中删除以下目录后，即可重新下载");
+              setNotice(state.modelDir);
+            }}>重新下载</button>
+          </>
+          : <button type="button" disabled={busy} onClick={() => void download()}>{busy ? "正在下载" : "下载模型"}</button>}
+        {busy && state?.downloading && <button type="button" onClick={() => void invoke("cancel_local_asr_download").catch(() => undefined)}>取消下载</button>}
+      </div>
+      {notice && <p className="form-notice">{notice}</p>}
+    </div>
   );
 }

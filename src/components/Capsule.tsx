@@ -77,7 +77,7 @@ function estimateDictationTextWidth(text: string) {
 type ContextMenuState = { x: number; above: boolean; origin?: WindowPosition } | null;
 type CapsuleSize = "compact" | "standard" | "wide";
 type EdgeColorMode = "rainbow" | "blue";
-type DictationRecognitionMode = "native" | "ai";
+type DictationRecognitionMode = "native" | "ai" | "local";
 type InlineMessage = Pick<ChatMessage, "id" | "role" | "content">;
 type StreamPayload = { requestId: string; delta?: string; done: boolean; error?: string };
 type ScreenTranslationStatus = { active: boolean; loading: boolean; error?: string | null };
@@ -359,7 +359,7 @@ function normalizedAppearance(value: Partial<Appearance>): Appearance {
   dictationCorrection: value.dictationCorrection !== false,
   dictationMemory: value.dictationMemory !== false,
   dictationEdgeEnabled: value.dictationEdgeEnabled !== false,
-  dictationMode: value.dictationMode === "native" ? "native" : "ai",
+  dictationMode: value.dictationMode === "native" ? "native" : value.dictationMode === "local" ? "local" : "ai",
   aiDictationPolish: value.aiDictationPolish !== false,
     realtimeEdgeEnabled: value.realtimeEdgeEnabled !== false,
     clickThrough: value.clickThrough === true,
@@ -490,6 +490,7 @@ export function Capsule() {
   const dictationPcmRingSamples = useRef(0);
   const dictationPcmRate = useRef(16000);
   const dictationRetryAudio = useRef<{ kind: "pcm"; pcmBase64: string; sampleRate: number } | { kind: "blob"; blob: Blob } | null>(null);
+  const dictationPcmEngine = useRef<"cloud" | "local">("cloud");
   const dictationTranslateToEnglish = useRef(false);
   const dictationTransformRequestId = useRef<string | null>(null);
   const dictationTransformText = useRef("");
@@ -1240,7 +1241,10 @@ export function Capsule() {
     dictationRetryAudio.current = { kind: "pcm", pcmBase64, sampleRate };
     setDictationPhase("recognizing");
     try {
-      const text = await invoke<string>("transcribe_realtime_dictation_audio", { pcmBase64, sampleRate });
+      const engine = dictationPcmEngine.current;
+      const text = engine === "local"
+        ? await invoke<string>("transcribe_local_dictation", { pcmBase64, sampleRate })
+        : await invoke<string>("transcribe_realtime_dictation_audio", { pcmBase64, sampleRate });
       if (dictationFlowId.current !== flowId) return;
       const transcript = text.trim();
       if (!transcript) throw new Error("语音识别没有听到有效内容");
@@ -1580,7 +1584,9 @@ export function Capsule() {
     // 听写不再点亮屏幕边缘光：只显示独立的听写胶囊。
     const shouldShowEdge = mode === "realtime" ? appearance.realtimeEdgeEnabled : mode === "chat" ? appearance.edgeEnabled : false;
     if (shouldShowEdge) void beginEdge(0.2);
+    const useLocalDictation = mode === "dictation" && appearance.dictationMode === "local";
     const useAiDictation = mode === "dictation" && appearance.dictationMode === "ai";
+    if (useLocalDictation || useAiDictation) dictationPcmEngine.current = useLocalDictation ? "local" : "cloud";
     let microphoneStream: MediaStream | null = null;
     if (!useAiDictation) {
       const Constructor = browserSpeechConstructor();
@@ -1736,10 +1742,10 @@ export function Capsule() {
       if (useAiDictation) {
         setDictationPhase("listening");
         let captureActive = false;
-        if (useRealtime) {
-          // 流式模型：PCM 采集与会话解耦——会话启动失败时照样采集，
-          // 本地环形缓冲（上限 120s）作为失败/中断/无转写时的权威恢复来源。
-          const outputRate = realtimeSession?.sampleRate ?? 16000;
+        if (useRealtime || useLocalDictation) {
+          // 流式/本地模型共用 PCM 采集：会话失败时照样采集，本地环形缓冲（上限 120s）
+          // 作为失败/中断/无转写时的权威恢复来源。本地模式没有云端会话（sessionId 为 null）。
+          const outputRate = useLocalDictation ? 16000 : realtimeSession?.sampleRate ?? 16000;
           const captureContext = new AudioContext({ latencyHint: "interactive" });
           if (captureContext.state === "suspended") await captureContext.resume().catch(() => undefined);
           const captureSource = captureContext.createMediaStreamSource(stream);
@@ -1752,7 +1758,7 @@ export function Capsule() {
               processor: worklet,
               source: captureSource,
               silentGain,
-              sessionId: realtimeSession?.sessionId ?? null,
+              sessionId: (useRealtime && realtimeSession?.sessionId) || null,
               sendQueue: Promise.resolve(),
               sampleRate: outputRate,
             };
@@ -1783,7 +1789,16 @@ export function Capsule() {
             captureActive = false;
           }
         }
-        if (!captureActive) startBatchRecorder(stream);
+        if (!captureActive) {
+          if (useLocalDictation) {
+            // 本地模式没有云端批量兜底：采集失败直接报错并复位。
+            stopListening(false);
+            setDictationError("本地录音采集不可用");
+            setDictationPhase("error");
+          } else {
+            startBatchRecorder(stream);
+          }
+        }
       }
       const context = new AudioContext({ latencyHint: "interactive" });
       if (context.state === "suspended") await context.resume();
